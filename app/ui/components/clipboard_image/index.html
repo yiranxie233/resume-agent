@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      :root { color-scheme: light dark; font-family: system-ui, "Microsoft YaHei", sans-serif; }
+      body { margin: 0; }
+      #paste-zone {
+        box-sizing: border-box; width: 100%; min-height: 92px; padding: 18px;
+        border: 1.5px dashed #8b95a5; border-radius: 10px; cursor: text;
+        display: grid; place-items: center; text-align: center; outline: none;
+        background: rgba(128, 128, 128, 0.04);
+      }
+      #paste-zone:focus { border-color: #ff4b4b; box-shadow: 0 0 0 2px rgba(255,75,75,.16); }
+      #title { font-size: 15px; font-weight: 650; }
+      #hint { margin-top: 5px; font-size: 12px; opacity: .72; }
+      #status { margin-top: 7px; font-size: 12px; color: #d94841; }
+      img { display: none; margin-top: 10px; max-width: 100%; max-height: 180px; border-radius: 6px; }
+    </style>
+  </head>
+  <body>
+    <div id="paste-zone" tabindex="0" role="button" aria-label="粘贴岗位截图">
+      <div>
+        <div id="title">点击这里，然后按 Ctrl+V 粘贴剪贴板截图</div>
+        <div id="hint">粘贴后会立即送入本机 PaddleOCR；确认文字前不会创建岗位</div>
+        <div id="status"></div>
+        <img id="preview" alt="已粘贴截图预览" />
+      </div>
+    </div>
+    <script>
+      const MAX_BYTES = 10 * 1024 * 1024;
+      const zone = document.getElementById("paste-zone");
+      const status = document.getElementById("status");
+      const preview = document.getElementById("preview");
+      const post = (type, extra = {}) => window.parent.postMessage(
+        { isStreamlitMessage: true, type, ...extra }, "*"
+      );
+      const resize = () => post("streamlit:setFrameHeight", { height: document.body.scrollHeight + 4 });
+      post("streamlit:componentReady", { apiVersion: 1 });
+      resize();
+      zone.addEventListener("click", () => zone.focus());
+      zone.addEventListener("paste", (event) => {
+        const items = Array.from(event.clipboardData?.items || []);
+        const item = items.find((entry) => entry.kind === "file" && entry.type.startsWith("image/"));
+        if (!item) {
+          status.textContent = "剪贴板中没有图片，请先复制岗位截图。";
+          resize();
+          return;
+        }
+        event.preventDefault();
+        const file = item.getAsFile();
+        if (!file || file.size > MAX_BYTES) {
+          status.textContent = "截图不能超过 10 MB。";
+          resize();
+          return;
+        }
+        const reader = new FileReader();
+        reader.onload = () => {
+          const dataUrl = String(reader.result || "");
+          preview.src = dataUrl;
+          preview.style.display = "block";
+          status.textContent = "已读取剪贴板截图，正在提交识别……";
+          resize();
+          post("streamlit:setComponentValue", {
+            value: {
+              paste_id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+              name: file.name || "clipboard.png",
+              type: file.type || "image/png",
+              data_url: dataUrl
+            },
+            dataType: "json"
+          });
+        };
+        reader.onerror = () => { status.textContent = "读取剪贴板截图失败，请改用图片上传。"; resize(); };
+        reader.readAsDataURL(file);
+      });
+    </script>
+  </body>
+</html>

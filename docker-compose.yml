@@ -1,0 +1,22 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: resume-agent-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: resume_agent
+      POSTGRES_USER: resume
+      POSTGRES_PASSWORD: resume
+    ports:
+      - "5433:5432"
+    volumes:
+      - resume_agent_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U resume -d resume_agent"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+volumes:
+  resume_agent_pgdata:
+

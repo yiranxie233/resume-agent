@@ -1,0 +1,56 @@
+# Python / uv
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.uv-cache/
+
+# Secrets and machine-local configuration
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+*.pem
+*.key
+*.p12
+*.pfx
+config.local.*
+
+# Runtime data (database, uploaded resumes, task output, preference skill,
+# internal token, backups, cached templates and the authenticated Edge profile)
+data/
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.log
+
+# User documents, screenshots and generated artifacts
+简历*.md
+resume.local.md
+photos/
+output/
+uploads/
+exports/
+previews/
+backups/
+*.docx
+*.pdf
+
+# Browser/CDP state that may contain cookies or login sessions
+edge-profile/
+**/edge-profile/
+DevToolsActivePort
+ResumeAgentDebugPort
+
+# Editors and operating system metadata
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+Desktop.ini
