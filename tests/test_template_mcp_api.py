@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from app.main import download_template, search_templates
+from app.main import _attach_template_visual_preview, download_template, search_templates
+from app.services.export_service import PreviewResult
 
 
 class _GitHubManager:
@@ -65,6 +68,58 @@ class _TemplateMirror:
 
 
 class TemplateMcpApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cached_markdown_preview_is_renderable_not_a_text_excerpt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data_root = Path(directory)
+            template = data_root / "templates" / "cache" / "github-test" / "resume.md"
+            template.parent.mkdir(parents=True)
+            template.write_text("# 中文简历\n\n## 项目经历\n", encoding="utf-8")
+            app_state = SimpleNamespace(settings=SimpleNamespace(data_root=data_root))
+            with patch("app.main.state", return_value=app_state):
+                rendered = await _attach_template_visual_preview(
+                    {"path": str(template), "file_type": "markdown"},
+                    requested=True,
+                )
+
+        self.assertEqual(rendered["visual_preview"]["status"], "ready")
+        self.assertEqual(rendered["visual_preview"]["mime_type"], "text/markdown")
+        self.assertIn("## 项目经历", rendered["visual_preview"]["content"])
+
+    async def test_docx_preview_falls_back_to_safe_browser_page_without_office(self) -> None:
+        from docx import Document
+
+        with tempfile.TemporaryDirectory() as directory:
+            data_root = Path(directory)
+            template = data_root / "templates" / "cache" / "github-test" / "中文简历模板.docx"
+            template.parent.mkdir(parents=True)
+            document = Document()
+            document.add_heading("中文技术简历", level=1)
+            document.add_paragraph("个人信息 项目经历 专业技能 教育经历")
+            document.save(template)
+            app_state = SimpleNamespace(settings=SimpleNamespace(data_root=data_root))
+            unavailable = PreviewResult(
+                "pdf",
+                "dependency_missing",
+                None,
+                None,
+                None,
+                ("no office",),
+            )
+            with (
+                patch("app.main.state", return_value=app_state),
+                patch("app.main.convert_docx_to_pdf", return_value=unavailable),
+            ):
+                rendered = await _attach_template_visual_preview(
+                    {"path": str(template), "file_type": "docx"},
+                    requested=True,
+                )
+
+        visual = rendered["visual_preview"]
+        self.assertEqual(visual["status"], "ready")
+        self.assertEqual(visual["mime_type"], "text/html")
+        self.assertTrue(visual["approximate_layout"])
+        self.assertIn("docx-page", visual["content"])
+
     async def test_search_and_download_use_github_mcp(self) -> None:
         manager = _GitHubManager()
         mirror = _TemplateMirror()

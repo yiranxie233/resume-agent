@@ -19,6 +19,48 @@ def stable_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
 
 
+def extract_json_value(value: str, *, expected_keys: Iterable[str] = ()) -> Any:
+    """Extract one JSON value from a chat response without evaluating text.
+
+    OpenAI-compatible relays and local models sometimes wrap an otherwise
+    valid JSON object in Markdown, a short explanation, or a ``<think>``
+    block.  Taking everything between the first ``{`` and last ``}`` is not
+    safe enough because those wrappers can contain their own braces.  Scan
+    every possible JSON start with ``JSONDecoder.raw_decode`` and prefer the
+    largest value containing the caller's expected top-level keys.
+    """
+
+    text = str(value or "").lstrip("\ufeff").strip()
+    if not text:
+        raise json.JSONDecodeError("empty model response", text, 0)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as original:
+        decoder = json.JSONDecoder()
+        expected = {str(key) for key in expected_keys if str(key)}
+        candidates: list[tuple[int, int, int, Any]] = []
+        for index, char in enumerate(text):
+            if char not in "{[":
+                continue
+            try:
+                payload, end = decoder.raw_decode(text, index)
+            except json.JSONDecodeError:
+                continue
+            matched = (
+                len(expected.intersection(payload))
+                if expected and isinstance(payload, dict)
+                else 0
+            )
+            candidates.append((matched, end - index, index, payload))
+        if not candidates:
+            raise
+        # Expected contract keys are more important than wrapper size.  For
+        # equally suitable values, prefer the largest and then the later one,
+        # which is commonly the final answer after a reasoning preamble.
+        candidates.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+        return candidates[0][3]
+
+
 def sha256_text(value: str) -> str:
     return hashlib.sha256(canonical_text(value).encode("utf-8")).hexdigest()
 

@@ -25,7 +25,11 @@ class FeedbackClassification:
 
     @property
     def requires_clarification(self) -> bool:
-        return self.confidence < 0.85 or bool(self.conflicts)
+        # Free-form preference feedback is safe to pass through as an
+        # untrusted instruction even when the rules cannot confidently label
+        # its category.  Pause only for a real contradiction (or an effectively
+        # empty/unusable note), not merely because the wording is unfamiliar.
+        return self.confidence < 0.5 or bool(self.conflicts)
 
     def to_dict(self) -> dict[str, object]:
         return {

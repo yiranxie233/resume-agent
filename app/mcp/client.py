@@ -322,6 +322,20 @@ class MCPStdioClient:
         else:
             future.set_result(result)
 
+    def _consume_owner_result(self, task: asyncio.Task[None]) -> None:
+        """Consume late owner failures so loop shutdown never leaks warnings."""
+
+        if task.cancelled():
+            return
+        try:
+            error = task.exception()
+        except asyncio.CancelledError:
+            return
+        if error is not None and self._state.status not in {"closing", "stopped"}:
+            translated = self._translate(error, "lifecycle")
+            self._state.status = "failed"
+            self._state.last_error_code = translated.error_code
+
     async def _owner_main(self, started: asyncio.Future[None]) -> None:
         """Own the AnyIO-backed SDK context for its complete lifetime.
 
@@ -422,6 +436,15 @@ class MCPStdioClient:
         except asyncio.CancelledError:
             self._finish_future(started, error=MCPNotReadyError(self.spec.name, "MCP startup cancelled"))
             raise
+        except Exception as exc:
+            # Context-manager cleanup can fail after a timed-out SDK call
+            # (notably while an AnyIO stdio transport is unwinding). Keep the
+            # owner task from leaking an unobserved exception and expose a
+            # stable failed health state to the next explicit retry.
+            translated = self._translate(exc, "lifecycle")
+            self._state.status = "failed"
+            self._state.last_error_code = translated.error_code
+            self._finish_future(started, error=translated)
         finally:
             self._session = None
             while not queue.empty():
@@ -457,6 +480,7 @@ class MCPStdioClient:
                 self._owner_main(started),
                 name=f"mcp-owner-{self.spec.name}",
             )
+            self._owner_task.add_done_callback(self._consume_owner_result)
             try:
                 await asyncio.shield(started)
             except asyncio.CancelledError:
@@ -638,14 +662,13 @@ def default_server_specs(
         "RESUME_AGENT_DATA_ROOT": str((data_root or (root / "data")).resolve())
     }
     if edge_profile_dir is None:
-        local_app_data = os.getenv("LOCALAPPDATA")
-        if os.name == "nt" and local_app_data:
-            # Edge sandboxed GPU/renderer processes may be denied access to a
-            # profile beneath Desktop.  LocalAppData is Edge's native writable
-            # location and prevents the browser from exiting during CDP use.
-            edge_profile_dir = Path(local_app_data) / "ResumeAgent" / "edge-profile"
-        else:
-            edge_profile_dir = Path(child_env["RESUME_AGENT_DATA_ROOT"]) / "edge-profile"
+        # Keep the isolated login profile under the configured writable data
+        # root. A temp profile can outlive a timed-out MCP child and then be
+        # adopted by Edge Startup Boost without publishing its old debugging
+        # port, which leaves every later search unable to attach. The project
+        # data root is durable, ignored by Git, and already permission-checked
+        # by Settings.ensure_directories().
+        edge_profile_dir = Path(child_env["RESUME_AGENT_DATA_ROOT"]) / "edge-profile"
     child_env["RESUME_AGENT_EDGE_PROFILE_DIR"] = str(edge_profile_dir.expanduser().resolve())
     resolved_edge_path = edge_path
     if not resolved_edge_path:
@@ -669,7 +692,7 @@ def default_server_specs(
             args=("-m", "app.mcp.boss_server"),
             cwd=root,
             env=child_env,
-            call_timeout_seconds=45.0,
+            call_timeout_seconds=90.0,
         ),
         "github": MCPServerSpec(
             name="github",

@@ -4,13 +4,14 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from app.core.schemas import JobUrlRequest
+from app.core.schemas import JobInput, JobUrlRequest
 from app.core.store import InMemoryStore
 from app.main import (
     close_job_browser,
     environment_recheck,
     job_from_url,
     open_job_in_collection_browser,
+    save_job_corrections,
     search_jobs,
 )
 
@@ -109,6 +110,18 @@ class _Mirror:
         return f"snapshot-{job_id}-{len(self.persisted)}"
 
 
+class _LoginRequiredBossManager(_BossManager):
+    async def call_tool(self, server: str, tool: str, arguments: dict) -> dict:
+        if tool == "boss_search_jobs":
+            return {
+                "ok": False,
+                "data": {"message": "请先登录"},
+                "error_code": "boss_login_required",
+                "requires_user": True,
+            }
+        return await super().call_tool(server, tool, arguments)
+
+
 class JobMcpApiTests(unittest.IsolatedAsyncioTestCase):
     async def test_boss_recheck_includes_real_browser_prerequisites(self) -> None:
         manager = _BossManager()
@@ -133,6 +146,7 @@ class JobMcpApiTests(unittest.IsolatedAsyncioTestCase):
             mcp_manager=manager,
             mcp_startup_errors={},
             consents={"post_time_risk:global": {"granted": True}},
+            job_parse_confirmations={},
         )
         with patch("app.main.state", return_value=app_state):
             first = await search_jobs({"title": "Python 后端", "city": "深圳", "limit": 20}, None)
@@ -152,8 +166,69 @@ class JobMcpApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(detail["job_id"], first["jobs"][0]["job_id"])
             current = app_state.store.get_job(detail["job_id"])
             self.assertEqual(current.responsibilities, ["负责 FastAPI 服务开发"])
-            self.assertEqual(current.hr_activity, "本周活跃")
+            # The recruiter state split directly from the search card is
+            # authoritative. The asynchronous detail pane may still contain
+            # the previously selected job and must not overwrite it.
+            self.assertEqual(current.hr_activity, "在线")
             self.assertEqual(len(app_state.store.list_jobs()), 2)
+
+            # A later authoritative card render may contain a newer activity
+            # value and must replace the stale card value saved previously.
+            manager.calls.clear()
+            original_call = manager.call_tool
+
+            async def refreshed_card(server: str, tool: str, arguments: dict) -> dict:
+                response = await original_call(server, tool, arguments)
+                if tool == "boss_search_jobs":
+                    response["data"]["items"][0]["hr_name"] = "曹先生"
+                    response["data"]["items"][0]["hr_activity"] = "3日内活跃"
+                return response
+
+            manager.call_tool = refreshed_card  # type: ignore[method-assign]
+            refreshed = await search_jobs(
+                {"title": "Python 后端", "city": "深圳", "limit": 20}, None
+            )
+            self.assertEqual(refreshed["jobs"][0]["hr_name"], "曹先生")
+            self.assertEqual(refreshed["jobs"][0]["hr_activity"], "3日内活跃")
+
+            # A partially rendered virtual card is not an authoritative HR
+            # pair.  Never combine its new activity with a name saved from an
+            # earlier complete card, because that produces a pair which was
+            # never shown together on BOSS.
+            async def activity_without_name(server: str, tool: str, arguments: dict) -> dict:
+                response = await original_call(server, tool, arguments)
+                if tool == "boss_search_jobs":
+                    response["data"]["items"][0].pop("hr_name", None)
+                    response["data"]["items"][0]["hr_activity"] = "今日活跃"
+                return response
+
+            manager.call_tool = activity_without_name  # type: ignore[method-assign]
+            partial = await search_jobs(
+                {"title": "Python 后端", "city": "深圳", "limit": 20}, None
+            )
+            self.assertEqual(partial["jobs"][0]["hr_name"], "曹先生")
+            self.assertEqual(partial["jobs"][0]["hr_activity"], "3日内活跃")
+
+            # A later card render may omit the recruiter state. It must not
+            # erase the precise value already obtained from the detail page.
+            third = await search_jobs(
+                {"title": "AI 智能体", "city": "深圳", "limit": 20}, None
+            )
+            unknown_card = next(
+                item for item in third["jobs"] if item["source_url"].endswith("example-2.html")
+            )
+            unknown_job_id = unknown_card["job_id"]
+            known = app_state.store.get_job(unknown_job_id).model_copy(
+                update={"hr_activity": "3天内活跃"}
+            )
+            app_state.store.update_job(unknown_job_id, known)
+            fourth = await search_jobs(
+                {"title": "AI 智能体", "city": "深圳", "limit": 20}, None
+            )
+            preserved = next(
+                item for item in fourth["jobs"] if item["job_id"] == unknown_job_id
+            )
+            self.assertEqual(preserved["hr_activity"], "3天内活跃")
 
     async def test_close_browser_delegates_without_clearing_login(self) -> None:
         manager = _BossManager()
@@ -181,6 +256,74 @@ class JobMcpApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["browser"], "collection_edge")
         self.assertIn(("boss", "boss_open_job_page", {"url": url}), manager.calls)
+
+    async def test_logged_out_search_never_returns_stale_cached_jobs(self) -> None:
+        manager = _LoginRequiredBossManager()
+        store = InMemoryStore()
+        store.save_job(
+            JobInput(
+                title="历史 Python 岗位",
+                city="深圳",
+                raw_text="这是旧缓存",
+            )
+        )
+        app_state = SimpleNamespace(
+            store=store,
+            db_mirror=None,
+            mcp_manager=manager,
+            mcp_startup_errors={},
+            consents={"post_time_risk:global": {"granted": True}},
+            job_parse_confirmations={},
+        )
+
+        with patch("app.main.state", return_value=app_state):
+            result = await search_jobs(
+                {"title": "Python", "city": "深圳", "limit": 20}, None
+            )
+
+        self.assertEqual(result["status"], "waiting_user")
+        self.assertEqual(result["error_code"], "boss_login_required")
+        self.assertEqual(result["jobs"], [])
+        self.assertIsNone(result["next_cursor"])
+
+    async def test_human_job_corrections_update_only_editable_jd_fields(self) -> None:
+        store = InMemoryStore()
+        job_id = store.save_job(
+            JobInput(
+                title="AI 工程师",
+                company="示例公司",
+                city="深圳",
+                responsibilities=["旧职责"],
+                requirements=["旧要求"],
+                skills=["Python"],
+                raw_text="旧 JD",
+            )
+        )
+        app_state = SimpleNamespace(
+            store=store,
+            db_mirror=None,
+            job_parse_confirmations={job_id: True},
+        )
+
+        with patch("app.main.state", return_value=app_state):
+            result = await save_job_corrections(
+                job_id,
+                {
+                    "raw_text": "岗位职责\n负责智能体开发\n任职要求\n熟悉 LangGraph",
+                    "edited_responsibilities": ["负责智能体开发"],
+                    "edited_requirements": ["熟悉 LangGraph"],
+                    "edited_skills": ["Python", "LangGraph"],
+                },
+                None,
+            )
+
+        current = store.get_job(job_id)
+        self.assertEqual(result["parser"]["parser_mode"], "human_corrected")
+        self.assertEqual(current.company, "示例公司")
+        self.assertEqual(current.responsibilities, ["负责智能体开发"])
+        self.assertEqual(current.requirements, ["熟悉 LangGraph"])
+        self.assertEqual(current.skills, ["Python", "LangGraph"])
+        self.assertFalse(app_state.job_parse_confirmations[job_id])
 
 if __name__ == "__main__":
     unittest.main()

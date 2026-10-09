@@ -347,6 +347,9 @@ class DatabaseMirror:
         checkpoint_version = int(getattr(task, "checkpoint_version", 0))
         for key in (
             "base_facts",
+            "template_structure_snapshot",
+            "requested_output_mode",
+            "final_product",
             "project_patch",
             "preview_feedback",
             "module_decisions",
@@ -570,7 +573,11 @@ class DatabaseMirror:
                 record.skills = job.skills
                 record.posted_at = job.posted_at
                 record.posted_time_status = "known" if job.posted_at else "unknown"
-                record.extra = {**dict(record.extra or {}), "hr_activity": job.hr_activity}
+                record.extra = {
+                    **dict(record.extra or {}),
+                    "hr_name": job.hr_name,
+                    "hr_activity": job.hr_activity,
+                }
                 record.parser_version = "job-parser-v1"
                 if existing_snapshot is not None:
                     session.commit()
@@ -1140,6 +1147,17 @@ class DatabaseMirror:
                                 "project_patch": task_state.get("project_patch"),
                                 "module_patches": task_state.get("module_patches"),
                                 "output_mode": task_state.get("output_mode"),
+                                "requested_output_mode": task_state.get(
+                                    "requested_output_mode"
+                                ),
+                                "final_product": task_state.get("final_product"),
+                                "template_id": task_state.get("template_id"),
+                                "template_structure_snapshot": task_state.get(
+                                    "template_structure_snapshot"
+                                ),
+                                "base_facts": _compact_base_facts(
+                                    task_state.get("base_facts")
+                                ),
                             }
                         ),
                     }
@@ -1159,6 +1177,10 @@ class DatabaseMirror:
                         "compression_decision",
                         "output_mode",
                         "template_id",
+                        "template_structure_snapshot",
+                        "requested_output_mode",
+                        "final_product",
+                        "base_facts",
                         "previous_snapshot_ids",
                         "final_confirmation",
                     )
@@ -1689,6 +1711,7 @@ class DatabaseMirror:
                             responsibilities=(row.responsibilities or "").splitlines(),
                             requirements=(row.requirements or "").splitlines(),
                             skills=list(row.skills or []),
+                            hr_name=(row.extra or {}).get("hr_name"),
                             hr_activity=(row.extra or {}).get("hr_activity"),
                             posted_at=row.posted_at,
                             posted_at_label="发布时间未知" if row.posted_at is None else None,
@@ -1728,6 +1751,7 @@ class DatabaseMirror:
                         responsibilities=(snapshot.responsibilities or "").splitlines(),
                         requirements=(snapshot.requirements or "").splitlines(),
                         skills=list(snapshot.skills or []),
+                        hr_name=(job_record.extra or {}).get("hr_name") if job_record else None,
                         hr_activity=(job_record.extra or {}).get("hr_activity") if job_record else None,
                         posted_at=snapshot.posted_at,
                         posted_at_label="发布时间未知" if snapshot.posted_at is None else None,
@@ -1949,7 +1973,21 @@ class DatabaseMirror:
                         if not isinstance(version.content, dict) or "value" not in version.content:
                             continue
                         suffix = version.module_type.removeprefix("task_state:")
-                        if suffix in {"base_facts", "project_patch", "preview_feedback"}:
+                        if suffix in {
+                            "base_facts",
+                            "project_patch",
+                            "preview_feedback",
+                            "module_decisions",
+                            "layout_decision",
+                            "compression_decision",
+                            "output_mode",
+                            "template_id",
+                            "template_structure_snapshot",
+                            "requested_output_mode",
+                            "final_product",
+                            "previous_snapshot_ids",
+                            "final_confirmation",
+                        }:
                             compact_state[suffix] = version.content.get("value")
                         elif suffix.startswith("module_draft:"):
                             compact_state.setdefault("module_drafts", {})[suffix.split(":", 1)[1]] = version.content.get("value")

@@ -19,6 +19,8 @@ dependencies = [
   "langchain-core>=0.2",
   "langgraph>=0.2",
   "python-multipart>=0.0.9",
+  "cryptography>=42",
+  "websocket-client>=1.9.2",
 ]
 
 [project.optional-dependencies]
@@ -41,6 +43,7 @@ include = ["app*"]
 testpaths = ["tests"]
 pythonpath = ["."]
 asyncio_mode = "auto"
+cache_dir = "data/.pytest_cache"
 
 [tool.ruff]
 line-length = 100

@@ -7,12 +7,23 @@ __pycache__/
 .ruff_cache/
 .mypy_cache/
 .uv-cache/
+.coverage
+htmlcov/
+build/
+dist/
+.run/
+.cache/
+*.tmp
+*.bak
+*.zip
 
 # Secrets and machine-local configuration
 .env
 .env.*
 !.env.example
 .streamlit/secrets.toml
+.codex/
+.agents/
 *.pem
 *.key
 *.p12
@@ -22,6 +33,11 @@ config.local.*
 # Runtime data (database, uploaded resumes, task output, preference skill,
 # internal token, backups, cached templates and the authenticated Edge profile)
 data/
+weights/
+.paddlex/
+.paddleocr/
+**/credentials/model-secrets.json
+**/credentials/model-secrets.key
 *.db
 *.db-journal
 *.db-shm

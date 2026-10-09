@@ -37,7 +37,8 @@ Resume Agent 用于减少 BOSS 直聘场景中“一岗一简历”的制作成�
 
 ### 3.1 初版范围
 
-- BOSS 直聘网页版职位 URL 解析，或按职位名称和城市搜索职位。
+- 按职位名称和城市搜索 BOSS 职位卡片，并在用户选择后解析详情；不再向用户提供直接粘贴 BOSS 卡片 URL 的入口。
+- 公司招聘官网网址输入入口仅作预留，初版不访问、不抓取也不解析，以免对未知站点结构做错误承诺。
 - BOSS 岗位卡片与详情页的招聘 HR 活跃状态提取。
 - 岗位截图粘贴/上传、PP-OCRv6 medium 本地识别、人工校正与确认。
 - 中文 `.docx` 和文本型 PDF 简历导入；PDF 不做 OCR。
@@ -87,7 +88,7 @@ Resume Agent 用于减少 BOSS 直聘场景中“一岗一简历”的制作成�
 └──────────────────────┘       └──────────────────────────────┘
 
 Local tools: python-docx/PyMuPDF, PP-OCRv6 medium, Word first,
-LibreOffice fallback, in-memory credential scope (no key/token persistence).
+LibreOffice fallback, encrypted model-key recovery plus scoped in-memory handles.
 ```
 
 ### 4.1 进程边界
@@ -97,7 +98,7 @@ LibreOffice fallback, in-memory credential scope (no key/token persistence).
 - FastAPI：业务 API、任务队列、图执行、文件和数据库协调。
 - Streamlit：轻量 UI，只通过 FastAPI 调用业务，不直接写数据库。
 - Edge helper：独立进程，启动可见 Edge，使用独立 profile；只监听 `127.0.0.1`。
-- BOSS MCP、GitHub MCP：标准 MCP `stdio` 服务，由主应用管理生命周期。
+- BOSS MCP、GitHub MCP：使用官方 MCP SDK 的 `mcp.server.fastmcp.FastMCP` 注册工具并以 `stdio` 运行，由主应用管理生命周期。
 - Word/LibreOffice：宿主机安装的渲染和转换引擎。
 - Ollama：宿主机可选服务，启动时探测，不由应用自动安装。
 - PostgreSQL：固定版本官方镜像、Docker volume、本地配置初始化。
@@ -130,7 +131,7 @@ LibreOffice fallback, in-memory credential scope (no key/token persistence).
 4. 启动 Edge helper 和两个 stdio MCP 子进程，注册工具并执行健康检查。
 5. 启动 Streamlit，打开环境检查页面。
 6. 先扫描并处理遗留 `pending` 节点操作；无法判定的任务冻结并显示恢复冲突。
-7. 仅恢复 PostgreSQL 中状态为 `running`、`waiting_user` 或 `paused` 且没有未处理操作的任务，标记需要用户选择继续或重试。恢复外部模型任务前检查内存凭据和模型探测状态；缺少凭据时保持 `status=paused, blocked_reason=needs_credentials`，本地模型被卸载或能力探测过期时保持 `status=paused, blocked_reason=needs_model_recheck`，不能静默换模型。
+7. 仅恢复 PostgreSQL 中状态为 `running`、`waiting_user` 或 `paused` 且没有未处理操作的任务，标记需要用户选择继续或重试。恢复外部模型任务前从本机加密凭据仓库重新生成有作用域的内存 handle，并检查模型探测状态；凭据无法解密或不存在时保持 `status=paused, blocked_reason=needs_credentials`，本地模型被卸载或能力探测过期时保持 `status=paused, blocked_reason=needs_model_recheck`，不能静默换模型。
 
 Docker 未安装、数据库无法连接或 Edge 环境缺失时，只阻止依赖它们的功能，并在环境页给出修复动作。Word/LibreOffice、Ollama、GitHub Token 检查失败可以跳过。
 
@@ -150,7 +151,7 @@ Edge 支持自动检测 `msedge.exe` 路径，检测失败时允许手动指定�
 
 ## 6. 标准 MCP 设计
 
-两个 MCP 必须使用 Python MCP SDK（实现时固定依赖版本）和 JSON-RPC `stdio` 传输，不能只做普通 Python 函数。FastAPI 作为 MCP host/client，负责启动、关闭、健康检查和超时。初版只供本项目本地调用，不对外开放端口。
+两个 MCP 使用锁定版本官方 Python MCP SDK 内置的 `mcp.server.fastmcp.FastMCP` 注册工具，以 JSON-RPC `stdio` 传输，不能只做普通 Python 函数。业务 handler 保留可单测的字典输入/稳定 envelope，但协议 schema、工具分发和 framing 由 FastMCP 负责。FastAPI 作为 MCP host/client，负责启动、关闭、健康检查和超时。初版只供本项目本地调用，不对外开放端口。
 
 MCP 和 Edge helper 的工具结果统一使用 Pydantic envelope：
 
@@ -189,16 +190,17 @@ MCP 和 Edge helper 的工具结果统一使用 Pydantic envelope：
 - 登录失效、验证码、滑块和访问限制出现时暂停，用户在可见 Edge 中手动处理后再继续。
 - 解析失败不自动循环重试；只在用户点击“重新解析”后再试。
 - 不再依赖 `boss show time` 推断 BOSS 未公开展示的岗位发布时间，也不把未知发布时间作为新鲜度依据。
-- 列表卡片出现 `.boss-online-icon` 时记录“在线”；其他卡片记录“活跃时间待解析”。只有用户选择岗位并打开详情后，才读取 `.boss-active-time` 得到“刚刚活跃、今日活跃、几天前活跃、本周活跃”等精确值，避免为每条摘要打开详情造成额外风控。
+- 列表阶段从每张岗位卡片分别提取公司名、招聘 HR 姓名和页面原始活跃文字，禁止把 `.boss-name` 当公司名；活跃正则必须覆盖“两周活跃/两周内活跃/2 周活跃”等中文或阿拉伯数字形式，且不得自行换算。卡片未提供完整招聘者信息时，在同一个已登录的岗位采集 Edge 搜索页中依次选择左侧卡片；只有右侧详情标题或职位链接与目标卡片一致后，才成对读取 `hr_name/hr_activity`，禁止读取上一张卡片残留内容。不得为补采新建详情标签、导航或刷新搜索文档，也不得启动第二个浏览器。页面未提供状态、加载超时或遇到验证时才保留“活跃时间待解析”，不得猜测。
 - 加载下一页时渐进滚动最后一张卡片和 document 底部，最长等待 15–20 秒并监测新卡片。一次未返回新卡片仅设置 `load_pending=true`、保留原 `next_cursor`；只有页面出现可见的明确结束标识才设置 `exhausted=true` 并清除游标。
+- 浏览器适配器保存搜索标签的 CDP target ID。用户主动打开职位查看标签或当前前台标签改变后，后续翻页、详情临时解析和补采必须按 target ID 恢复原搜索标签；target 不可用时才按稳定的 `query/city` 搜索参数回退定位，不能因为详情标签处于前台而重启或刷新搜索页。
 
 ### 6.3 职位字段与筛选
 
-职位记录至少包含：岗位名称、公司、城市、薪资、岗位职责、任职要求、技能要求、招聘 HR 活跃状态、来源 URL、详情快照路径、抓取时间和解析证据。旧数据的 `posted_at/posted_at_label` 仅为兼容字段，新采集与界面筛选不依赖它们。
+职位记录至少包含：岗位名称、公司、城市、薪资、岗位职责、任职要求、技能要求、招聘 HR 姓名、招聘 HR 原始活跃状态、来源 URL、详情快照路径、抓取时间和解析证据。旧数据的 `posted_at/posted_at_label` 仅为兼容字段，新采集与界面筛选不依赖它们。
 
 每个任务必须保存 `job_snapshot_id`，匹配、候选生成、内容优化和导出只读取该不可变快照及其 `evidence_id`，不能读取职位当前记录。
 
-HR 活跃筛选默认不限，可选择“在线或刚刚活跃、今日活跃、近 3 天活跃、本周活跃、活跃时间待解析”。列表页无法取得精确状态的记录必须保留并标记“活跃时间待解析”，不得猜测活跃时间。
+HR 活跃筛选默认不限，可选择“在线或刚刚活跃、今日活跃、近 3 天活跃、本周活跃、活跃时间待解析”。筛选使用卡片直接值或同一采集 Edge 的详情补采值；仍无法取得精确状态的记录必须保留并标记“活跃时间待解析”，不得猜测活跃时间。
 
 用户可从历史记录选择已解析 JD，避免重复访问 BOSS；历史 JD 提供“刷新”操作。刷新会更新职位当前记录，但不会改写任何既有任务绑定的不可变 `job_snapshot`；新任务使用刷新后的新快照，旧任务继续使用创建时的快照和证据。
 
@@ -207,7 +209,8 @@ HR 活跃筛选默认不限，可选择“在线或刚刚活跃、今日活跃�
 - UI 同时提供剪贴板图片粘贴组件和本地图片上传，接受 PNG、JPG/JPEG、WEBP、BMP，单张最大 10 MB、最大 4000 万像素。
 - FastAPI `POST /api/jobs/screenshot/ocr` 只执行真实图片校验和本地 PP-OCRv6 medium 识别，返回 `ocr_id/text/lines[{text,score,box}]/model`；原图不落盘，确认前不得创建 `JobInput`。
 - OCR 模型懒加载为进程单例并用线程锁保护；Windows CPU 显式 `enable_mkldnn=false`，规避 PaddlePaddle 3.3 的 PP-OCRv6 oneDNN/PIR 兼容错误。模型缺失或不可读时返回可修复错误，不静默下载或切换模型。
-- UI 将 OCR 原文放入可编辑文本框。用户填写岗位名称并校正后调用 `POST /api/jobs/screenshot/confirm`；后端校验仍在 30 分钟有效期内的 `ocr_id` 后才解析 JD、创建职位和不可变快照。确认操作为单消费者，重复提交不能生成重复职位。
+- UI 将 OCR 原文放入可编辑文本框，不再要求用户另外填写岗位名称、公司或城市。后端从校正文字保守提取卡片元数据，缺失标题时使用“截图岗位”，再调用规则解析和所选聊天模型。`POST /api/jobs/screenshot/confirm` 校验仍在 30 分钟有效期内的 `ocr_id` 后才创建职位和快照；确认操作为单消费者，重复提交不能生成重复职位。
+- OCR 检测框按视觉行聚类后再按横坐标排序，避免同一行轻微纵向抖动导致文字倒序。聊天模型增强失败时必须返回 OCR 校正文字、规则解析职位和 `model_fallback=true`；UI 必须回到包含原截图、可编辑 OCR 文字、规则结构、“使用当前模型重试”和“接受规则结果继续”的确认阶段，不能直接进入模型成功后的操作；重试调用现有职位重新解析接口，不要求再次上传。
 - 岗位截图 OCR 与简历 PDF 边界独立：扫描版简历 PDF 仍拒绝，不能借岗位截图接口绕过简历输入约束。
 
 ### 6.5 GitHub 模板 MCP 工具
@@ -224,7 +227,7 @@ HR 活跃筛选默认不限，可选择“在线或刚刚活跃、今日活跃�
 
 只展示中文 `.docx` 或 Markdown 模板，许可证必须明确允许修改和本地使用；许可证不明、禁止修改或要求在简历成品中附带署名/版权声明的模板直接排除。卡片展示仓库链接、许可证、Star 数、最后更新时间和来源。GitHub Token 可选，仅在当前 GitHub MCP 请求的内存中使用；无 Token 使用匿名请求。Token 不写入配置、数据库、日志或备份。
 
-用户选中的模板复制到本地模板目录并保存版本信息。检测到远程更新时只提示用户选择下载或继续当前版本。GitHub 不可用时使用已缓存模板；没有缓存时使用内置一页中文模板。
+用户选中的模板复制到本地模板目录并保存版本信息。UI 显示“在 GitHub 查找、简历下载（x/x）、校验预览、完成”的阶段进度；失败信息至少区分凭据、限流、FastMCP 进程、DNS/连接/超时、许可证和模板文件问题，并提供修复建议及显式重试。检测到远程更新时只提示用户选择下载或继续当前版本。GitHub 不可用时使用已缓存模板；没有缓存时使用内置一页中文模板。
 
 ## 7. LangGraph 智能体设计
 
@@ -326,6 +329,8 @@ LangGraph checkpoint 只保存流程控制状态、当前节点、checkpoint 版
 
 候选项目默认 3 个，可调为 1–5 个。任务创建候选槽位时分配稳定的 `candidate_slot_id`（如 `slot-1`），并行生成只允许写入自己的槽位。某个槽位失败或用户主动重试时只重跑该槽位，不改变其他槽位。完成后统一做 Pydantic 校验、相似度去重和岗位侧重点检查；去重淘汰的槽位保持记录并标记原因，补生成只填入缺失槽位。最终排序按后端匹配分降序，再按固定 `candidate_slot_id` 做 tie-break；仍不足指定数量时将步骤标记为 `partial`，交给用户决定继续补生成或接受当前数量。
 
+Streamlit 在任务处于 `queued/running` 时按 1 秒间隔只轮询任务 API 并重绘当前页面，不触发 BOSS 页面导航或刷新。任务进入 `waiting_user` 后直接展示本轮所有非重复候选，不要求用户手动点击“刷新状态”。
+
 ### 7.7 智能体算法执行性审查
 
 本轮需求澄清后，以下关键算法和恢复决策已经冻结：稳定 `thread_id`、`request_key`、checkpoint 乐观锁、字段级补丁、不可变 `resume_snapshot`、worker lease、JD/job snapshot、任务级模型配置版本、候选槽位/去重、字段确认失效、上下文预算、反馈分类阈值、MCP envelope 和崩溃补偿状态机。它们可以直接拆成数据库迁移、纯函数测试和 LangGraph 节点实现。
@@ -408,7 +413,7 @@ Ollama 检测必须区分 `executable_missing`（命令行程序不存在）、`
 
 聊天 profile 的 `dimension` 为 `null`，并返回 `generation`、`structured_json`、`tool_call`、`streaming` 等能力；embedding profile 不要求这些聊天能力。示例中的 digest 和维度仅用于说明字段；默认模型名固定为 `qwen2.5:7b` 与 `bge-m3`，但用户可在设置中替换。
 
-OpenAI 兼容接口的 `chat` 分别探测 `/chat/completions`，`embedding` 分别探测 `/embeddings`；`base_url` 是否已经包含 `/v1` 必须由 adapter 规范化，禁止拼出重复路径。Ollama 使用其原生 `/api/*` 路径，不发送 OpenAI 鉴权头。外部接口使用 `Authorization: Bearer <key>`，但 key 只能在本次请求内存中存在。
+OpenAI 兼容接口的 `chat` 分别探测 `/chat/completions`，`embedding` 分别探测 `/embeddings`；`base_url` 是否已经包含 `/v1` 必须由 adapter 规范化，禁止拼出重复路径。Ollama 使用其原生 `/api/*` 路径，不发送 OpenAI 鉴权头。外部接口按 profile 选择 `Authorization: Bearer <key>` 或 `Authorization: <key>`；聊天与 Embedding profile 各自绑定独立凭据，调用时只把解密后的 key 放入短期内存 handle。
 
 支持结构化输出时优先使用；不支持时使用严格 JSON 提示词、Pydantic 校验和有限重试。`tool call` 或 `streaming` 为可选能力时，探测失败不应阻止保存默认模型；角色必需能力失败则不能设为 `ready`。探测状态和错误码必须可被前端直接展示，不能只返回一条无法区分原因的字符串。
 
@@ -451,7 +456,9 @@ OpenAI 官方 Agents 指南将 Agents SDK 定位为运行在应用内、使用�
 
 ### 9.2 结构化预览
 
-解析后展示并允许修正姓名、联系方式、教育经历、工作经历、项目经历和模块边界。用户手动修正的内容视为已确认事实。若无法识别项目区域，暂停流程，用户在预览中选择起止段落并为每个区域填写项目名。
+文件解析器先提取可复制文字并产生规则区块；随后用户从全部 `status=ready` 的云端或 Ollama 聊天模型中选择一个，调用 `POST /api/resumes/{resume_id}/model-parse` 做结构化拆解。模型只允许返回原文中的连续片段，后端把模型片段重新定位为原始文字切片，无法验证、模块非法或模型补造的区块直接丢弃；模型失败时保留规则区块并允许更换模型重试，不要求重新上传。
+
+解析后展示机器识别的全部区块，并允许逐区块修正模块类型、标题和正文。文本型 PDF 同时在本地 Streamlit 会话中嵌入原始 PDF 页面供对照，不创建公开文件 URL。保存时每个修改携带原正文哈希，哈希不一致则拒绝覆盖；所有区块明确确认且至少存在一个项目经历区块后，任务创建接口才允许继续。用户手动修正的内容视为已确认事实。若无法识别项目区域，停留在该可编辑解析结果，不得绕过确认直接进入匹配。
 
 PDF 先解析并重建为可编辑 DOCX。若文字顺序或版式信息严重混乱，暂停并提示无法安全重建，而不是继续产生错位文件。
 
@@ -459,6 +466,7 @@ PDF 先解析并重建为可编辑 DOCX。若文字顺序或版式信息严重�
 
 - 有原简历：询问保留原模板或选择 GitHub 模板，并分别展示预览。
 - 无原简历：先从 GitHub 中文模板选择，获取失败或用户不选择时使用内置模板。
+- 模板向导调用标准 GitHub MCP 搜索最多 5 个中文候选，逐个完成许可证校验、下载缓存和预览后再允许选择。Markdown 模板填充基础资料与项目区块；DOCX 模板保留原文件并替换受支持的 `{{name}}`、`{{resume_content}}` 等占位符，未提供完整内容占位符时必须在导出警告中说明降级行为。
 - 迁移到新模板后先生成完整预览，用户确认布局后才进入匹配和内容优化。
 - 映射或排版无法安全完成时暂停，保留原简历版本，让用户回到原模板或取消迁移。
 
@@ -474,7 +482,7 @@ PDF 先解析并重建为可编辑 DOCX。若文字顺序或版式信息严重�
 
 ### 10.1 JD 拆解
 
-JD 解析结果至少包含岗位目标、职责清单、任职要求、技能清单、关键词集合和来源段落证据。每个拆解后的原子职责、技能和关键词都必须绑定有效 `evidence_id`；缺证据、重复冲突或结构化校验失败时，只允许重试/重新解析，不能将无来源原子项用于评分或生成。解析出的清单在匹配页面展示，但用户不能手动修改解析结果；如解析失败，只能重新解析，不能用手动粘贴替代详情解析。
+JD 解析结果至少包含岗位目标、职责清单、任职要求、技能清单、关键词集合和来源段落证据。每个拆解后的原子职责、技能和关键词都必须绑定有效 `evidence_id`；缺证据、重复冲突或结构化校验失败时，不能将无来源原子项用于评分或生成。解析后必须进入用户确认门：用户可填写补充/修正信息，模型结合 JD、用户确认的补充信息和上一次结构反复重解析；每轮仍做证据校验并展示完整结果，只有用户明确确认后才允许匹配和项目生成。
 
 ### 10.2 匹配评分
 
@@ -638,7 +646,7 @@ JD 解析结果至少包含岗位目标、职责清单、任职要求、技能�
 | `model_invocations` | `request_key`、模型配置版本、请求参数摘要、结构化响应引用、上下文哈希、证据 ID、状态和错误摘要；完整 prompt/response 仅在调试模式临时留存 |
 | `worker_leases` | `worker_id`、`task_id`、租约状态、过期时间和最近心跳 |
 | `langgraph_checkpoints` | 按 `thread_id` 保存轻量图 checkpoint、节点状态、checkpoint 版本和业务对象引用 |
-| `job_records` | 职位字段、来源 URL、`extra.hr_activity`、兼容发布时间、快照哈希和解析版本 |
+| `job_records` | 职位字段、来源 URL、`extra.hr_name/extra.hr_activity`、兼容发布时间、快照哈希和解析版本 |
 | `job_snapshots` | 任务使用的不可变 JD 字段、原始快照引用、证据集合和抓取版本 |
 | `job_evidence` | JD 段落、字段证据、来源定位、稳定 `evidence_id` 和文本哈希 |
 | `resume_files` | 原始/重建文件、格式、页数、哈希和任务引用 |
@@ -661,7 +669,7 @@ JD 解析结果至少包含岗位目标、职责清单、任职要求、技能�
 | `export_runs` | 强制绑定 `snapshot_id`，并记录引擎、格式、页数、预览、反馈和合规状态 |
 | `backup_manifests` | 备份清单、校验值、创建时间和恢复记录 |
 
-API Key、GitHub Token 不保存到数据库、配置文件、日志或备份，也不写入 Windows Credential Manager/DPAPI。它们只在当前进程的内存中短暂存在：API Key 仅随检测或任务请求提交，GitHub Token 仅随 GitHub MCP 请求提交；服务重启后必须重新输入并检测。异步 worker 只能接收带 TTL 的内存凭据句柄，不能把明文凭据写入队列；进程重启、TTL 到期或凭据被清除时，任务保持 `status=paused, blocked_reason=needs_credentials`，暂停恢复并提示用户重新输入。数据库只保存非敏感的 profile 配置和 `credential_required=true` 状态。
+模型 API Key 不保存到数据库、普通配置、日志、任务快照或备份。新保存值统一使用 AES-GCM 与单独生成的本机权限受限密钥，密文和密钥位于 `data/credentials/`；该目录禁止进入 Git 和备份。旧版 DPAPI 密文仅做兼容读取，无法解密时要求用户重新输入一次，禁止仅凭“密文记录存在”显示为已保存。写入后必须立即解密回读校验；服务启动或任务调用时从加密仓库重新生成带 TTL、按 profile 隔离的内存 handle，明文不进入队列。GitHub Token 仍只在当前进程内存中使用。凭据无法解密、被删除或 handle 失效且无法重建时，任务保持 `status=paused, blocked_reason=needs_credentials`。数据库只保存非敏感 profile 和 `credential_required=true`。
 
 ## 14. 本地文件布局
 
@@ -681,7 +689,7 @@ API Key、GitHub Token 不保存到数据库、配置文件、日志或备份，
 ├─ skills/resume-preferences.md
 ├─ backups/
 ├─ logs/
-├─ edge-profile/                 # 旧版位置；Windows 运行时改用 %LOCALAPPDATA%/ResumeAgent/edge-profile
+├─ edge-profile/                 # BOSS 独立 Edge 登录态；仅本机保存且不提交 Git
 └─ app-config.toml               # 不保存密钥明文
 ```
 
@@ -734,6 +742,7 @@ GET  /api/jobs/history
 POST /api/resumes/upload
 GET  /api/resumes/history
 POST /api/resumes/{resume_id}/parse
+POST /api/resumes/{resume_id}/model-parse # 选择 ready 的云端/本地聊天模型；失败保留规则结果
 PATCH /api/resumes/{resume_id}/sections
 POST /api/resumes/{resume_id}/mark-project-region
 
@@ -766,15 +775,15 @@ POST /api/backups/validate
 POST /api/backups/restore
 ```
 
-`POST /api/credentials/session` 的请求体可以包含一个 profile 的 API Key 或 GitHub Token，但响应只返回不可逆的 `credential_handle_id`、作用域和过期时间；明文不进入响应、日志、SSE、checkpoint 或数据库。创建外部模型任务时，客户端在请求体中携带当前内存 handle；worker 通过 handle 读取凭据并在 TTL 到期后清除。服务重启后 handle 全部失效，相关任务按 `blocked_reason=needs_credentials` 暂停。
+`POST /api/credentials/session` 的请求体可以包含一个 profile 的模型 API Key 或 GitHub Token，但响应只返回不可逆的 `credential_handle_id`、作用域和过期时间；明文不进入响应、日志、SSE、checkpoint 或数据库。模型 API Key 默认同步写入本机加密仓库，GitHub Token 不持久化。创建外部模型任务时，聊天和 Embedding 分别携带自己的内存 handle；服务重启后旧 handle 失效，但后端可从加密仓库重新生成，只有重建失败时才按 `blocked_reason=needs_credentials` 暂停。
 
 ## 17. 安全、隐私与日志
 
 ### 17.1 凭据
 
-- API Key、GitHub Token 均为 write-only 输入，只在当前进程内存中短暂使用；界面不回显明文，`GET /api/settings` 只返回 `credential_required`、`configured_in_session` 和最近探测状态。
-- 两类凭据不写入 Windows Credential Manager/DPAPI、配置文件、PostgreSQL、日志、快照或备份。服务重启、用户清除会话或凭据 TTL 到期后必须重新输入并检测。
-- 恢复备份后相关配置显示“未配置”；依赖外部模型或 GitHub 的排队任务保持 `status=paused, blocked_reason=needs_credentials`，不得以空凭据自动重试。
+- 模型 API Key 与 GitHub Token 均为 write-only，界面不回显明文。模型 Key 可在本机加密保存；GitHub Token 只在当前进程内存中短暂使用。
+- 模型 Key 不写入普通配置、PostgreSQL、日志、快照或备份；加密密文和本机密钥位于被 Git/备份排除的 `data/credentials/`。聊天和 Embedding 凭据按 profile 隔离。
+- 恢复备份不会恢复凭据；本机原有加密仓库仍可用时自动重建 handle，否则依赖外部模型或 GitHub 的任务保持 `status=paused, blocked_reason=needs_credentials`。
 
 ### 17.2 外部模型同意
 
@@ -794,7 +803,7 @@ FastAPI、Streamlit、Edge helper 只监听 loopback；内部请求必须携带�
 
 ### 18.1 备份
 
-用户手动点击执行备份。备份包括 PostgreSQL 数据、任务目录、原始简历、JD 快照、导出文件、模板缓存、Skill 和版本记录；排除 API Key、GitHub Token、Edge profile 和 BOSS 登录会话。备份不额外加密。
+用户手动点击执行备份。备份包括 PostgreSQL 数据、任务目录、原始简历、JD 快照、导出文件、模板缓存、Skill 和版本记录；排除 `data/credentials/`、API Key、GitHub Token、Edge profile 和 BOSS 登录会话。备份不额外加密。
 
 备份创建期间阻止新任务，并等待当前任务进入可保存状态，生成包含文件清单、版本信息和 SHA-256 校验值的归档。
 
@@ -817,14 +826,14 @@ FastAPI、Streamlit、Edge helper 只监听 loopback；内部请求必须携带�
 ### 阶段 1：环境与凭据
 
 - Edge/Word/LibreOffice/Ollama 检测。
-- 内存凭据作用域、TTL、清除和 `needs_credentials` 恢复门禁（不持久化 API Key/GitHub Token）。
+- 模型 API Key 本机加密存储、profile 作用域、内存 handle、TTL、清除和 `needs_credentials` 恢复门禁；GitHub Token 不持久化。
 - 模型配置、能力探测、默认模型门禁。
 
 ### 阶段 2：MCP 与职位
 
 - Python stdio MCP host/servers。
 - Playwright Edge helper、登录状态和人工处理暂停。
-- BOSS URL/搜索/可靠分页/详情/快照/HR 活跃状态与访问风险确认。
+- BOSS 搜索/可靠分页/按需详情/快照/HR 活跃状态与访问风险确认；公司招聘官网网址入口仅预留。
 - 岗位截图粘贴/上传、PP-OCRv6 medium 识别、校正与确认 API。
 - GitHub 模板搜索、许可证过滤、预览和缓存。
 
@@ -859,9 +868,10 @@ FastAPI、Streamlit、Edge helper 只监听 loopback；内部请求必须携带�
 - 工具调用多轮累计的消息、schema 和工具结果必须重新计算预算；provider 返回 `context_length_exceeded` 时不得自动重试或推进图状态。
 - embedding 的最大输入长度和 chunk 策略独立于聊天模型窗口；长度未知或 chunk 失败时阻止向量生成，除非用户明确选择降级。
 - tokenizer/估算器测试必须覆盖中文、英文、混合文本、JSON、输出 schema、工具 schema 和边界“刚好放入/超出 1 token”场景；tokenizer 加载失败只能显式走保守 fallback，窗口未知或估算异常必须在发出模型请求前阻止。
-- BOSS URL 白名单、登录暂停、访问风险确认和 HR 活跃状态提取均生效。
+- BOSS 内部详情 URL 白名单、登录暂停、访问风险确认和 HR 活跃状态提取均生效；网页不展示直接粘贴 BOSS URL 的入口。
 - 搜索首批最多 20 条；慢加载不清除分页游标，可再次点击；只有明确到底才禁用下一页；详情按选择后请求，HR 活跃筛选和历史 JD 刷新符合定义。
-- 剪贴板粘贴与图片上传均可进入 OCR；非法/超限图片被拒绝；缺依赖/缺模型给出修复提示；校正确认前不创建职位，确认后使用修正文本解析 JD。
+- 剪贴板粘贴与图片上传均可进入 OCR；非法/超限图片被拒绝；缺依赖/缺模型给出修复提示；截图分支不要求岗位名称、城市等搜索条件，校正 OCR 文字后使用规则与模型解析 JD。
+- 每次规则/模型解析或按反馈重新解析后，岗位都处于“待用户确认”状态；`POST /api/jobs/{job_id}/confirm-parse` 成功前禁止创建生成任务。用户可以基于上一次结构化结果持续补充并重新解析。
 - JD 刷新不会改变既有任务的 `job_snapshot_id`、证据或匹配复现结果。
 - `.docx`/文本型 PDF 校验 10 MB/3 页；扫描 PDF 和 `.doc` 被拒绝。
 - 解析结果可手动修正；无法识别项目时必须手动标记后才继续。
@@ -875,7 +885,7 @@ FastAPI、Streamlit、Edge helper 只监听 loopback；内部请求必须携带�
 
 ### 安全验收
 
-- 日志、备份、数据库和快照中不存在 API Key、GitHub Token、Cookie 或完整登录会话。
+- 日志、备份、数据库和任务快照中不存在模型 API Key 明文、GitHub Token、Cookie 或完整登录会话；加密凭据目录不进入 Git/备份。
 - 外部模型首次同意、撤销再确认和 HTTPS 校验生效。
 - 外部文本中的 prompt injection 不能改变系统策略。
 - Edge helper 和内部 API 未携带随机令牌时拒绝请求。

@@ -1,12 +1,9 @@
 """BOSS MCP stdio server backed by a user-visible Edge session."""
-from __future__ import annotations
-
 import threading
 from collections.abc import Callable
 from typing import Any
 
 from app.mcp.edge_adapter import EdgeActionRequired, EdgeBossAdapter, default_edge_adapter
-from app.mcp.stdio_server import StdioMCPServer
 from app.services.job_parser import validate_boss_url
 
 
@@ -73,6 +70,12 @@ def _adapter_call(operation: Callable[[], Any]) -> dict[str, Any]:
         return _envelope(
             data={"message": str(exc)},
             error_code="invalid_tool_arguments",
+            requires_user=True,
+        )
+    except PermissionError:
+        return _envelope(
+            data={"message": "Edge 登录目录没有写入权限，请更换为当前用户可写的 profile 目录"},
+            error_code="edge_profile_permission_denied",
             requires_user=True,
         )
     except Exception:
@@ -164,123 +167,90 @@ def close_browser(_: dict[str, Any]) -> dict[str, Any]:
     return _adapter_call(lambda: _get_adapter().close_browser())
 
 
-def _tool_definitions() -> dict[str, tuple[dict[str, Any], Callable[[dict[str, Any]], dict[str, Any]]]]:
-    return {
-        "boss_environment": (
+def create_server() -> Any:
+    """Build the official SDK FastMCP stdio server.
+
+    Handler functions above intentionally keep their dictionary contract so
+    unit tests and the FastAPI layer can invoke the exact same implementation.
+    FastMCP owns JSON-schema generation, protocol framing and tool dispatch.
+    """
+
+    from mcp.server.fastmcp import FastMCP
+
+    server = FastMCP(
+        "resume-agent-boss",
+        instructions="通过用户授权的 Microsoft Edge 会话采集 BOSS 职位信息。",
+        log_level="ERROR",
+    )
+
+    @server.tool(name="boss_environment", description="检查 Playwright 和 Edge 环境，不打开职位页")
+    def tool_environment() -> dict[str, Any]:
+        return environment({})
+
+    @server.tool(name="boss_validate_url", description="校验 BOSS 官方职位网址")
+    def tool_validate_url(url: str) -> dict[str, Any]:
+        return validate_url({"url": url})
+
+    @server.tool(name="boss_check_login", description="检查采集 Edge 的 BOSS 登录状态")
+    def tool_check_login() -> dict[str, Any]:
+        return check_login({})
+
+    @server.tool(name="boss_search_jobs", description="按岗位名称和城市搜索 BOSS 职位")
+    def tool_search_jobs(
+        title: str,
+        city: str,
+        city_code: str | None = None,
+        cursor: str | None = None,
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        return search_jobs(
             {
-                "description": "Inspect Playwright and Microsoft Edge prerequisites without navigation",
-                "inputSchema": {"type": "object"},
-            },
-            environment,
-        ),
-        "boss_validate_url": (
-            {
-                "description": "Validate an official BOSS URL",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {"url": {"type": "string"}},
-                    "required": ["url"],
-                },
-            },
-            validate_url,
-        ),
-        "boss_check_login": (
-            {"description": "Check visible Edge login state", "inputSchema": {"type": "object"}},
-            check_login,
-        ),
-        "boss_search_jobs": (
-            {
-                "description": "Search BOSS jobs by title and city",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "title": {"type": "string"},
-                        "city": {"type": "string"},
-                        "city_code": {
-                            "type": "string",
-                            "pattern": "^[0-9]{9}$",
-                            "description": "Optional explicit BOSS city code",
-                        },
-                        "cursor": {"type": "string"},
-                        "limit": {"type": "integer", "minimum": 1, "maximum": 20},
-                    },
-                    "required": ["title", "city"],
-                },
-            },
-            search_jobs,
-        ),
-        "boss_get_job_detail": (
-            {
-                "description": "Get selected job detail",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {"url": {"type": "string"}},
-                    "required": ["url"],
-                },
-            },
-            get_detail,
-        ),
-        "boss_open_job_page": (
-            {
-                "description": "Open a selected job in the retained collection Edge window",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {"url": {"type": "string"}},
-                    "required": ["url"],
-                },
-            },
-            open_job_page,
-        ),
-        "boss_extract_post_time": (
-            {
-                "description": "Extract publication time from independent DOM metadata rules",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {"url": {"type": "string"}, "text": {"type": "string"}},
-                },
-            },
-            extract_post_time,
-        ),
-        "boss_snapshot_job": (
-            {
-                "description": "Create a sanitized immutable job snapshot",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {"url": {"type": "string"}},
-                    "required": ["url"],
-                },
-            },
-            snapshot,
-        ),
-        "boss_reparse_job": (
-            {
-                "description": "Explicitly reparse a selected job URL",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {"job_id": {"type": "string"}, "url": {"type": "string"}},
-                    "required": ["url"],
-                },
-            },
-            reparse,
-        ),
-        "boss_logout": (
-            {"description": "Clear the visible Edge BOSS session", "inputSchema": {"type": "object"}},
-            logout,
-        ),
-        "boss_close_browser": (
-            {
-                "description": "Close the visible BOSS search window without clearing login state",
-                "inputSchema": {"type": "object"},
-            },
-            close_browser,
-        ),
-    }
+                "title": title,
+                "city": city,
+                "city_code": city_code,
+                "cursor": cursor,
+                "limit": limit,
+            }
+        )
+
+    @server.tool(name="boss_get_job_detail", description="解析用户选中的职位详情")
+    def tool_get_detail(url: str) -> dict[str, Any]:
+        return get_detail({"url": url})
+
+    @server.tool(name="boss_open_job_page", description="在保留的采集 Edge 中打开职位页")
+    def tool_open_job_page(url: str) -> dict[str, Any]:
+        return open_job_page({"url": url})
+
+    @server.tool(name="boss_extract_post_time", description="从独立 DOM 元数据规则提取发布时间")
+    def tool_extract_post_time(
+        url: str | None = None,
+        text: str | None = None,
+    ) -> dict[str, Any]:
+        return extract_post_time({"url": url, "text": text})
+
+    @server.tool(name="boss_snapshot_job", description="生成经过清理的职位快照")
+    def tool_snapshot(url: str) -> dict[str, Any]:
+        return snapshot({"url": url})
+
+    @server.tool(name="boss_reparse_job", description="显式重新解析职位网址")
+    def tool_reparse(url: str, job_id: str | None = None) -> dict[str, Any]:
+        return reparse({"url": url, "job_id": job_id})
+
+    @server.tool(name="boss_logout", description="清除采集 Edge 中的 BOSS 登录会话")
+    def tool_logout() -> dict[str, Any]:
+        return logout({})
+
+    @server.tool(name="boss_close_browser", description="关闭采集窗口但保留登录数据")
+    def tool_close_browser() -> dict[str, Any]:
+        return close_browser({})
+
+    return server
 
 
 def main() -> None:
-    server = StdioMCPServer("resume-agent-boss", "0.1.0", _tool_definitions())
+    server = create_server()
     try:
-        server.run()
+        server.run(transport="stdio")
     finally:
         if _adapter is not None:
             _adapter.close()

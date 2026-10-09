@@ -128,6 +128,10 @@ def _compact_state(state: dict[str, Any] | None) -> dict[str, Any]:
         # after restart.  Keep this object sanitized and compact; rich resume
         # text and binary files remain in their business tables/artifacts.
         "base_facts",
+        "template_id",
+        "template_structure_snapshot",
+        "requested_output_mode",
+        "final_product",
         "dimension_weights",
         "component_weights",
         "scoring_config_version",

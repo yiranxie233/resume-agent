@@ -38,11 +38,20 @@ class GraphState(TypedDict, total=False):
     chat_profile_snapshot: dict[str, Any]
     embedding_profile_snapshot: dict[str, Any]
     credential_handle_id: str | None
+    chat_credential_handle_id: str | None
+    embedding_credential_handle_id: str | None
     strict_model_gate: bool
     model_audit: dict[str, Any]
     base_facts: dict[str, Any]
     retry_step: str
     candidate_generation_status: str
+    output_mode: str
+    requested_output_mode: str
+    final_product: str
+    template_id: str | None
+    template_structure_snapshot: dict[str, Any]
+    selected_candidate: str
+    selected_candidate_id: str
     dimension_weights: dict[str, float]
     component_weights: dict[str, float]
     scoring_config_version: str
@@ -75,18 +84,25 @@ class _WorkerLeaseLost(RuntimeError):
 
 
 def _node_match(state: GraphState) -> GraphState:
-    job = JobInput.model_validate(state["job"])
-    resume = ResumeDocument.model_validate(state["resume"]) if state.get("resume") else None
-    dimension_weights = state.get("dimension_weights")
-    component_weights = state.get("component_weights")
-    result = calculate_match(
-        job,
-        resume,
-        weights=dict(dimension_weights) if isinstance(dimension_weights, dict) else None,
-        component_weights=dict(component_weights) if isinstance(component_weights, dict) else None,
-        embedding_mode=state.get("embedding_mode", "tfidf_fallback"),
-        scoring_config_version=str(state.get("scoring_config_version", "scoring-v1")),
-    )
+    try:
+        job = JobInput.model_validate(state["job"])
+        resume = ResumeDocument.model_validate(state["resume"]) if state.get("resume") else None
+        dimension_weights = state.get("dimension_weights")
+        component_weights = state.get("component_weights")
+        result = calculate_match(
+            job,
+            resume,
+            weights=dict(dimension_weights) if isinstance(dimension_weights, dict) else None,
+            component_weights=dict(component_weights) if isinstance(component_weights, dict) else None,
+            embedding_mode=state.get("embedding_mode", "tfidf_fallback"),
+            scoring_config_version=str(state.get("scoring_config_version", "scoring-v1")),
+        )
+    except Exception as exc:
+        try:
+            setattr(exc, "workflow_node", "match")
+        except Exception:
+            pass
+        raise
     return {
         **state,
         "match": result.model_dump(mode="json"),
@@ -101,6 +117,10 @@ def _node_candidates(state: GraphState, *, gateway: Any | None = None) -> GraphS
     from app.core.schemas import MatchResult
 
     match = MatchResult.model_validate(state["match"])
+    project_only = str(
+        state.get("requested_output_mode") or state.get("output_mode") or ""
+    ) == "project_only"
+    candidate_count = max(1, min(5, int(state.get("candidate_count", 3))))
     model_audit: dict[str, Any] | None = None
     use_model = bool(
         gateway
@@ -116,7 +136,8 @@ def _node_candidates(state: GraphState, *, gateway: Any | None = None) -> GraphS
                 profile=state["chat_profile"],
                 gateway=gateway,
                 credential_handle_id=state.get("credential_handle_id"),
-                count=state.get("candidate_count", 3),
+                embedding_credential_handle_id=state.get("embedding_credential_handle_id"),
+                count=candidate_count,
                 task_id=state["task_id"],
                 thread_id=state.get("thread_id"),
                 embedding_mode=state.get("embedding_mode", "tfidf_fallback"),
@@ -131,19 +152,24 @@ def _node_candidates(state: GraphState, *, gateway: Any | None = None) -> GraphS
             # deterministic path available and records why it was used.
             error_code = str(getattr(exc, "code", "") or "")
             if bool(state.get("strict_model_gate")) or error_code in _NON_DEGRADABLE_MODEL_ERRORS or bool(getattr(exc, "requires_user", False)):
+                try:
+                    setattr(exc, "workflow_node", "candidate_generation")
+                except Exception:
+                    pass
                 raise
             model_audit = {"fallback_reason": getattr(exc, "code", str(exc))}
             candidates = generate_candidates(
                 job,
                 resume,
                 match,
-                count=state.get("candidate_count", 3),
+                count=candidate_count,
                 task_id=state["task_id"],
                 branch_id=state.get("generation_branch_id", "branch-1"),
                 embedding_mode=state.get("embedding_mode", "tfidf_fallback"),
                 embedding_profile=state.get("embedding_profile"),
                 gateway=gateway,
                 credential_handle_id=state.get("credential_handle_id"),
+                embedding_credential_handle_id=state.get("embedding_credential_handle_id"),
                 thread_id=state.get("thread_id"),
                 feedback=state.get("last_feedback"),
             )
@@ -152,32 +178,55 @@ def _node_candidates(state: GraphState, *, gateway: Any | None = None) -> GraphS
             job,
             resume,
             match,
-            count=state.get("candidate_count", 3),
+            count=candidate_count,
             task_id=state["task_id"],
             branch_id=state.get("generation_branch_id", "branch-1"),
             embedding_mode=state.get("embedding_mode", "tfidf_fallback"),
             embedding_profile=state.get("embedding_profile"),
             gateway=gateway,
             credential_handle_id=state.get("credential_handle_id"),
+            embedding_credential_handle_id=state.get("embedding_credential_handle_id"),
             thread_id=state.get("thread_id"),
             feedback=state.get("last_feedback"),
         )
-    requested_count = max(1, min(5, int(state.get("candidate_count", 3))))
+    requested_count = candidate_count
     generation_status = "complete" if len(candidates) >= requested_count else "partial"
-    messages = [*state.get("messages", []), f"已生成 {len(candidates)} 个候选项目，等待选择或反馈"]
+    messages = [*state.get("messages", [])]
+    if project_only:
+        messages.append(
+            f"已生成 {len(candidates)} 份可复制项目经历，请选择并核实后直接复制使用"
+        )
+    else:
+        messages.append(f"已生成 {len(candidates)} 个候选项目，等待选择或反馈")
     if generation_status == "partial":
         messages.append(f"当前仅生成 {len(candidates)}/{requested_count} 个候选，用户可选择继续补生成")
     if model_audit and model_audit.get("fallback_reason"):
         messages.append(f"模型生成不可用，已使用本地降级：{model_audit['fallback_reason']}")
-    return {
+    result: GraphState = {
         **state,
         "candidates": [candidate.model_dump(mode="json") for candidate in candidates],
-        "current_node": "candidate_review",
+        "current_node": (
+            "candidate_confirmation"
+            if project_only and len(candidates) == 1
+            else "candidate_review"
+        ),
         "status": TaskStatus.WAITING_USER.value,
         "messages": messages,
         "model_audit": model_audit or {},
         "candidate_generation_status": generation_status,
     }
+    if project_only and len(candidates) == 1:
+        selected_id = candidates[0].candidate_id
+        result.update(
+            {
+                "selected_candidate": selected_id,
+                "selected_candidate_id": selected_id,
+                "candidate_count": candidate_count,
+                "output_mode": "project_only",
+                "requested_output_mode": "project_only",
+            }
+        )
+    return result
 
 
 def build_resume_graph(*, gateway: Any | None = None):
@@ -233,6 +282,8 @@ def _project_recommendation(task: TaskRecord) -> dict[str, Any]:
         rankings.append(
             {
                 "project_id": section.section_id,
+                "title": str(section.title or "未命名项目").strip(),
+                "content_preview": str(section.content or "").strip()[:120],
                 "match_score": score,
                 "matched_terms": hits,
             }
@@ -570,6 +621,11 @@ class WorkflowEngine:
         dimension_weights = task.state.get("dimension_weights")
         component_weights = task.state.get("component_weights")
         return {
+            # Preserve immutable task choices (output mode, template snapshot,
+            # base facts and credential/profile bindings).  Reconstructing a
+            # small subset here previously changed project-only tasks back to
+            # resume_edit after the first graph checkpoint.
+            **task.state,
             "task_id": task.task_id,
             "thread_id": task.thread_id,
             "job": task.job.model_dump(mode="json"),
@@ -585,6 +641,8 @@ class WorkflowEngine:
             "chat_profile_snapshot": chat_payload,
             "embedding_profile_snapshot": embedding_payload,
             "credential_handle_id": task.state.get("credential_handle_id"),
+            "chat_credential_handle_id": task.state.get("chat_credential_handle_id"),
+            "embedding_credential_handle_id": task.state.get("embedding_credential_handle_id"),
             "strict_model_gate": self.strict_model_gate,
             "base_facts": task.state.get("base_facts", {}),
             "retry_step": str(task.state.get("retry_step", "")),
@@ -812,12 +870,13 @@ class WorkflowEngine:
                 await finish_lease()
                 return current
             expected = current.checkpoint_version
+            result_node = str(result.get("current_node") or "candidate_review")
             self.store.checkpoint(
                 task_id,
                 expected,
                 state=result,
                 status=TaskStatus.WAITING_USER,
-                current_node="candidate_review",
+                current_node=result_node,
                 candidates=[CandidateProject.model_validate(item) for item in result.get("candidates", [])],
                 match=__import__("app.core.schemas", fromlist=["MatchResult"]).MatchResult.model_validate(result["match"]),
                 messages=result.get("messages", []),
@@ -825,9 +884,9 @@ class WorkflowEngine:
             persisted = self.store.get_task(task_id)
             if persisted and self.db_mirror:
                 self.db_mirror.persist_checkpoint(persisted)
-            self.store.append_event(task_id, {"type": "interrupt", "node": "candidate_review"})
+            self.store.append_event(task_id, {"type": "interrupt", "node": result_node})
             if self.db_mirror:
-                self.db_mirror.persist_event(task_id, {"type": "interrupt", "node": "candidate_review"})
+                self.db_mirror.persist_event(task_id, {"type": "interrupt", "node": result_node})
         except _WorkerLeaseLost:
             paused = self._pause_after_lease_loss(
                 task_id,
@@ -873,6 +932,7 @@ class WorkflowEngine:
                 )
             )
             status = TaskStatus.PAUSED if blocked else TaskStatus.FAILED
+            failed_node = str(getattr(exc, "workflow_node", "") or start_node)
             latest = self.store.get_task(task_id)
             if latest is None:
                 await finish_lease(release=not lease_lost.is_set())
@@ -889,7 +949,7 @@ class WorkflowEngine:
                     state={**latest.state, "blocked_reason": code if blocked else None},
                     status=status,
                     blocked_reason=code if blocked else None,
-                    current_node=start_node,
+                    current_node=failed_node,
                     messages=[*latest.messages, str(exc)],
                 )
             except VersionConflict:
@@ -899,10 +959,10 @@ class WorkflowEngine:
                     raise
                 await finish_lease(release=not lease_lost.is_set())
                 return current_after_conflict
-            self.store.append_event(task_id, {"type": "blocked" if blocked else "error", "error_code": code, "error": str(exc), "status": status.value})
+            self.store.append_event(task_id, {"type": "blocked" if blocked else "error", "error_code": code, "error": str(exc), "status": status.value, "node": failed_node})
             if self.db_mirror:
                 self.db_mirror.persist_checkpoint(updated)
-                self.db_mirror.persist_event(task_id, {"type": "blocked" if blocked else "error", "error_code": code, "message": str(exc), "status": status.value})
+                self.db_mirror.persist_event(task_id, {"type": "blocked" if blocked else "error", "error_code": code, "message": str(exc), "status": status.value, "node": failed_node})
         await finish_lease(release=not lease_lost.is_set())
         return self.store.get_task(task_id)  # type: ignore[return-value]
 
@@ -972,12 +1032,12 @@ class WorkflowEngine:
         # smuggling a valid payload into the wrong graph state.
         if task.status == TaskStatus.WAITING_USER:
             allowed_actions = {
-                "candidate_review": {"select", "approve", "confirm", "reject", "revise", "retry", "skip"},
+                "candidate_review": {"select", "approve", "confirm", "edit", "reject", "revise", "retry", "skip"},
                 # Selecting a candidate is deliberately separate from confirming
                 # its fields.  A selected draft may be inspected/edited, but it
                 # cannot become exportable until the confirmation endpoint sends
                 # hashes for every generated field.
-                "candidate_confirmation": {"confirm", "revise", "retry", "select", "reject"},
+                "candidate_confirmation": {"confirm", "edit", "revise", "retry", "select", "reject"},
                 "feedback_review": {"revise", "retry"},
                 "project_application": {"approve", "confirm", "select", "skip", "revise", "retry", "reject"},
                 "summary_review": {"approve", "revise", "skip"},
@@ -1015,11 +1075,21 @@ class WorkflowEngine:
                 # the same thread/checkpoint lineage.
                 retry_feedback = str(payload.get("feedback", "")).strip() if "feedback" in payload else str(task.state.get("last_feedback", ""))
                 retry_node = "candidate_generation" if task.match is not None else "match"
+                credential_refresh = {
+                    key: payload[key]
+                    for key in (
+                        "credential_handle_id",
+                        "chat_credential_handle_id",
+                        "embedding_credential_handle_id",
+                    )
+                    if payload.get(key)
+                }
                 result = self.store.checkpoint(
                     task_id,
                     expected_version,
                     state={
                         **task.state,
+                        **credential_refresh,
                         "last_feedback": retry_feedback,
                         "retry_step": retry_node,
                         # A user-triggered retry is a new draft branch even when
@@ -1038,6 +1108,115 @@ class WorkflowEngine:
                 return result
             raise ValueError("task is not waiting for a user action")
         node = task.current_node or "candidate_review"
+        if node in {"candidate_review", "candidate_confirmation"} and action == "edit":
+            candidate_id = str(
+                payload.get("candidate_id") or payload.get("candidate_slot_id") or ""
+            ).strip()
+            selected_candidate = next(
+                (
+                    candidate
+                    for candidate in candidates
+                    if candidate.candidate_id == candidate_id
+                    or candidate.candidate_slot_id == candidate_id
+                ),
+                None,
+            )
+            if selected_candidate is None:
+                raise ValueError("candidate_id is required and must belong to this task")
+            if selected_candidate.status in {"duplicate", "failed", "confirmed"}:
+                raise ValueError(f"{selected_candidate.status} candidate cannot be edited")
+            fields = payload.get("fields")
+            old_hashes = payload.get("old_value_hashes")
+            if not isinstance(fields, dict) or not fields:
+                raise ValueError("fields is required for candidate edit")
+            if not isinstance(old_hashes, dict):
+                raise ValueError("old_value_hashes is required for candidate edit")
+
+            editable = {
+                "title",
+                "period",
+                "introduction",
+                "tech_stack",
+                "solutions",
+                "results",
+            }
+            unknown = sorted(set(fields) - editable)
+            if unknown:
+                raise ValueError(f"candidate fields are not editable: {','.join(unknown)}")
+            update: dict[str, Any] = {}
+            field_patches: list[dict[str, str]] = []
+            for field_name, incoming in fields.items():
+                old_value = getattr(selected_candidate, field_name)
+                supplied_hash = str(old_hashes.get(field_name) or "")
+                expected_hash = _value_hash(old_value)
+                if supplied_hash != expected_hash:
+                    raise ValueError(f"candidate old value hash mismatch: {field_name}")
+                if field_name in {"tech_stack", "solutions", "results"}:
+                    if not isinstance(incoming, list):
+                        raise ValueError(f"{field_name} must be a list")
+                    normalized: Any = [
+                        str(value).strip()
+                        for value in incoming
+                        if str(value).strip()
+                    ]
+                else:
+                    normalized = str(incoming or "").strip()
+                    if field_name == "period" and not normalized:
+                        normalized = "[待补充]"
+                if field_name in {"title", "introduction"} and not normalized:
+                    raise ValueError(f"{field_name} cannot be empty")
+                update[field_name] = normalized
+                field_patches.append(
+                    {
+                        "field": field_name,
+                        "old_value_hash": expected_hash,
+                        "new_value_hash": _value_hash(normalized),
+                    }
+                )
+
+            replacement = CandidateProject.model_validate(
+                {
+                    **selected_candidate.model_dump(mode="json"),
+                    **update,
+                    "status": "draft",
+                    "needs_verification": True,
+                }
+            )
+            candidates = [
+                replacement
+                if candidate.candidate_id == selected_candidate.candidate_id
+                else candidate
+                for candidate in candidates
+            ]
+            edits = list(task.state.get("candidate_edits", []))
+            edits.append(
+                {
+                    "edit_id": f"candidate-edit-{uuid.uuid4().hex[:12]}",
+                    "candidate_id": replacement.candidate_id,
+                    "checkpoint_base": expected_version,
+                    "patches": field_patches,
+                }
+            )
+            next_state = {
+                **task.state,
+                "candidate_edits": edits,
+                # Any earlier confirmations were hashes of the pre-edit draft.
+                # They must never promote the newly edited values implicitly.
+                "confirmations": [],
+            }
+            result = self.store.checkpoint(
+                task_id,
+                expected_version,
+                state=next_state,
+                status=TaskStatus.WAITING_USER,
+                current_node=node,
+                candidates=candidates,
+                messages=[
+                    *task.messages,
+                    f"已保存候选项目 {replacement.candidate_slot_id} 的编辑；请重新核实字段后继续",
+                ],
+            )
+            return self._persist_user_transition(result)
         if node == "project_application" and action in {"approve", "confirm", "select", "skip"}:
             selected_id = str(task.state.get("selected_candidate") or "")
             selected_candidate = next(
@@ -1267,6 +1446,7 @@ class WorkflowEngine:
             compression = {
                 "accepted": False,
                 "allow_rewrite": False,
+                "level": "none",
                 "compliance_status": "multi_page_allowed" if pages > 1 else "one_page_estimated",
             }
             preview_state = self._preview_state(task, {**task.state, "layout_decision": layout}, compression=compression)
@@ -1286,9 +1466,13 @@ class WorkflowEngine:
                 raise ValueError("allow_rewrite=true is required before content rewriting")
             if action == "revise" and not task.state.get("previous_snapshot_ids"):
                 raise ValueError("content rewriting is allowed only after reviewing a layout-only preview")
+            compression_level = str(payload.get("compression_level") or "standard")
+            if compression_level not in {"standard", "aggressive"}:
+                raise ValueError("compression_level must be standard or aggressive")
             compression = {
                 "accepted": action != "skip",
                 "allow_rewrite": bool(payload.get("allow_rewrite", False)),
+                "level": compression_level if action != "skip" else "none",
                 "compliance_status": "compression_approved" if action != "skip" else "multi_page_allowed",
             }
             preview_state = self._preview_state(task, task.state, compression=compression)
@@ -1317,6 +1501,29 @@ class WorkflowEngine:
                     messages=[*task.messages, "用户已确认最终预览，任务完成"],
                 )
                 return self._persist_user_transition(result, create_snapshot=True)
+            if action == "retry" and payload.get("compression_level"):
+                compression_level = str(payload.get("compression_level"))
+                if compression_level not in {"standard", "aggressive"}:
+                    raise ValueError("compression_level must be standard or aggressive")
+                compression = {
+                    "accepted": True,
+                    "allow_rewrite": False,
+                    "level": compression_level,
+                    "compliance_status": "compression_approved",
+                }
+                result = self.store.checkpoint(
+                    task_id,
+                    expected_version,
+                    state={
+                        **task.state,
+                        "compression_decision": compression,
+                        "preview_status": "awaiting_user_confirmation",
+                    },
+                    status=TaskStatus.WAITING_USER,
+                    current_node="preview_review",
+                    messages=[*task.messages, "已切换为更强的无损排版压缩，请重新生成预览"],
+                )
+                return self._persist_user_transition(result)
             if action == "retry":
                 result = self.store.checkpoint(
                     task_id,
@@ -1485,6 +1692,43 @@ class WorkflowEngine:
                 if candidate.candidate_id == selected_candidate.candidate_id:
                     candidate.status = "confirmed"
                     candidate.needs_verification = False
+            requested_output = str(
+                task.state.get("requested_output_mode")
+                or task.state.get("output_mode")
+                or ""
+            )
+            if requested_output == "project_only":
+                result = self.store.checkpoint(
+                    task_id,
+                    expected_version,
+                    state={
+                        **task.state,
+                        "selected_candidate": selected_candidate.candidate_id,
+                        "selected_candidate_id": selected_candidate.candidate_id,
+                        "confirmed_candidate_id": selected_candidate.candidate_id,
+                        "confirmations": normalized_confirmations,
+                        "pending_module": None,
+                        "project_decision": {
+                            "selected_action": "copy_only",
+                            "status": "approved",
+                        },
+                        "project_patch": None,
+                        "output_mode": "project_only",
+                        "requested_output_mode": "project_only",
+                        "final_product": "project_only",
+                        "final_confirmation": True,
+                    },
+                    status=TaskStatus.COMPLETED,
+                    current_node="completed",
+                    candidates=candidates,
+                    messages=[
+                        *task.messages,
+                        "用户已核实项目字段，可直接复制纯文本使用",
+                    ],
+                )
+                return self._persist_user_transition(
+                    result, confirmations=normalized_confirmations
+                )
             project_decision = _project_recommendation(task)
             result = self.store.checkpoint(
                 task_id,

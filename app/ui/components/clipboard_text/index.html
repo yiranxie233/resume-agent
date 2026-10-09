@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      :root { color-scheme: light dark; font-family: system-ui, "Microsoft YaHei", sans-serif; }
+      body { margin: 0; display: flex; align-items: center; min-height: 38px; }
+      button {
+        min-height: 36px; padding: 0 14px; border: 1px solid #9aa2af; border-radius: 6px;
+        background: transparent; color: inherit; font: inherit; cursor: pointer;
+      }
+      button:hover { border-color: #ff4b4b; color: #ff4b4b; }
+      button:disabled { cursor: wait; opacity: .7; }
+      #status { margin-left: 10px; font-size: 13px; }
+    </style>
+  </head>
+  <body>
+    <button id="copy" type="button">复制项目经历</button><span id="status" aria-live="polite"></span>
+    <script>
+      let text = "";
+      const button = document.getElementById("copy");
+      const status = document.getElementById("status");
+      const post = (type, extra = {}) => window.parent.postMessage(
+        { isStreamlitMessage: true, type, ...extra }, "*"
+      );
+      post("streamlit:componentReady", { apiVersion: 1 });
+      post("streamlit:setFrameHeight", { height: 42 });
+      window.addEventListener("message", (event) => {
+        if (event.data?.type !== "streamlit:render") return;
+        const args = event.data.args || {};
+        text = String(args.text || "");
+        button.textContent = String(args.label || "复制项目经历");
+        button.disabled = !text;
+      });
+      button.addEventListener("click", async () => {
+        button.disabled = true;
+        try {
+          await navigator.clipboard.writeText(text);
+          status.textContent = "已复制";
+          post("streamlit:setComponentValue", { value: true, dataType: "json" });
+        } catch (_) {
+          status.textContent = "复制失败，请在下方文本中手动复制";
+        } finally {
+          button.disabled = !text;
+        }
+      });
+    </script>
+  </body>
+</html>

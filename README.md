@@ -1,418 +1,365 @@
 # Resume Agent
 
-Resume Agent 是一个本地运行的中文简历智能体。它可以通过可见的 Microsoft Edge 搜索 BOSS 直聘岗位、解析岗位职责与 JD，并根据岗位生成项目经历、修改已有简历或使用模板生成新简历。
+<div align="center">
 
-当前技术栈：FastAPI、Streamlit、LangChain、LangGraph、标准 MCP `stdio`、PostgreSQL、Playwright、Microsoft Edge 和 PaddleOCR v6。
+**A local-first Chinese resume tailoring agent for job discovery, JD analysis, project generation, resume editing, and one-page export.**
 
-## 1. 运行环境
+[English](README.md) · [简体中文](README.zh-CN.md)
 
-第一版主要面向 Windows 10/11。建议安装以下软件：
+![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)
+![FastAPI](https://img.shields.io/badge/FastAPI-Backend-009688?logo=fastapi&logoColor=white)
+![LangGraph](https://img.shields.io/badge/LangGraph-Agent-1C3C3C)
+![MCP](https://img.shields.io/badge/MCP-FastMCP%20stdio-6F42C1)
+![Deployment](https://img.shields.io/badge/Deployment-Local--first-2EA44F)
+![License](https://img.shields.io/badge/License-Not%20declared-lightgrey)
 
-| 软件 | 是否必需 | 用途 |
-| --- | --- | --- |
-| uv 与 Python 3.12（64 位） | 是 | 创建 `.venv` 并运行 API、网页、智能体和 MCP |
-| Git | 建议 | 下载和更新项目 |
-| Microsoft Edge | 是 | 搜索和解析 BOSS 岗位 |
-| Docker Desktop | 推荐 | 只用于运行 PostgreSQL |
-| Microsoft Word 或 LibreOffice | 可选 | 检查 DOCX/PDF 排版和导出 |
-| Ollama | 可选 | 使用本地聊天模型和 embedding 模型 |
-| PaddleOCR v6 medium | 截图功能必需 | 在本机识别粘贴或上传的岗位截图 |
+</div>
 
-可以在 PowerShell 中使用 `winget` 安装基础软件：
+Resume Agent turns a target job description into concrete, reviewable Chinese resume content. It can search BOSS jobs through an isolated Microsoft Edge profile, parse a selected JD with either an OpenAI-compatible or local Ollama model, generate multiple project candidates, replace a selected project in an uploaded resume, and export Markdown, DOCX, or PDF.
+
+The application is designed around human confirmation. Model-inferred claims remain marked for verification, template and resume structures are editable before use, and every resume mutation is applied as a field-level patch with hash and checkpoint conflict checks.
+
+> Project status: active local-first MVP. BOSS page structure and anti-abuse behavior can change without notice, so real-site collection still requires manual regression testing after Edge or BOSS updates.
+
+## Highlights
+
+- Guided Streamlit workflow instead of a crowded multi-panel form.
+- FastAPI backend with LangChain + LangGraph orchestration and durable `thread_id` checkpoints.
+- Standard MCP servers implemented with FastMCP over `stdio` for BOSS collection and GitHub template discovery.
+- OpenAI-compatible cloud chat/embedding profiles and dynamically discovered Ollama models.
+- Encrypted, machine-local cloud API-key persistence; secrets are never written to PostgreSQL or Git.
+- Upload one DOCX, Markdown, TXT, or text-based PDF (up to 10 MB and 3 PDF pages).
+- Model-assisted resume/template structure parsing followed by editable user confirmation.
+- Screenshot paste/upload with PaddleOCR v6, correction, model enhancement, and rule/OCR fallback.
+- Incremental BOSS result batches with retained search-tab recovery and background JD detail parsing.
+- Skill parsing preserves alternatives such as “Python, Java, or Go — choose one” as an OR group.
+- Candidate generation preserves valid earlier results and tops up until the requested count is reached.
+- Every generated candidate is directly editable and durably saved before selection; saving invalidates old field confirmations and records hash-based edit metadata.
+- Explicit add/replace project selection with auditable old-value hashes.
+- Markdown, DOCX, and PDF preview/download; DOCX can be rendered to PDF for visual review.
+- One-page checks and user-approved layout compression before any content rewrite.
+
+## Workflow
+
+```mermaid
+flowchart TD
+    A[Configure Edge and models] --> B{Resume source}
+    B -->|Upload resume| C[Extract text and layout]
+    B -->|Use template| D[Discover and preview Chinese templates]
+    B -->|Project only| E[Prepare copyable text output]
+    C --> F[Model structures resume]
+    D --> G[Model structures template]
+    F --> H[User edits and confirms blocks]
+    G --> H
+    E --> I{JD source}
+    H --> I
+    I -->|BOSS query| J[Incremental Edge collection]
+    I -->|Screenshot| K[PaddleOCR and correction]
+    I -->|Company site| L[Reserved adapter]
+    J --> M[Background JD detail parsing]
+    K --> M
+    M --> N[Rules plus selected chat model]
+    N --> O[User edits and confirms JD]
+    O --> P[LangGraph match and candidate generation]
+    P --> Q{Enough candidates?}
+    Q -->|No| R[Keep valid candidates and generate missing slots]
+    R --> Q
+    Q -->|Yes| S[User edits, saves, selects, and verifies one candidate]
+    S --> T{Output action}
+    T -->|Copy only| U[Copyable project text]
+    T -->|Add or replace| V[Hash-checked local resume patch]
+    V --> W[Preview and one-page review]
+    W --> X[Download Markdown, DOCX, or PDF]
+
+    Y[(PostgreSQL)] -. checkpoints and audit .-> P
+    Z[(Local data directory)] -. encrypted secrets and private artifacts .-> X
+```
+
+## Architecture
+
+| Layer | Implementation |
+| --- | --- |
+| Web UI | Streamlit |
+| HTTP API | FastAPI |
+| Agent workflow | LangChain + LangGraph |
+| Persistence | PostgreSQL in Docker; SQLite fallback for local trial |
+| MCP | FastMCP `stdio` servers managed by FastAPI |
+| BOSS browser | Microsoft Edge with an isolated app-owned profile and loopback CDP |
+| OCR | PaddleOCR v6 medium |
+| Documents | `python-docx`, PyMuPDF, Word or LibreOffice for visual conversion |
+| Models | OpenAI-compatible chat/embedding APIs or Ollama |
+
+## Requirements
+
+The first release targets Windows 10/11.
+
+- [uv](https://docs.astral.sh/uv/) and Python 3.11+ (Python 3.12 recommended)
+- Git
+- Microsoft Edge
+- Docker Desktop for the recommended PostgreSQL setup
+- Optional: Ollama for local chat and embedding models
+- Optional: Microsoft Word or LibreOffice for DOCX-to-PDF preview/export
+- Optional: PaddleOCR dependencies for screenshot parsing
+
+Install common tools from PowerShell:
 
 ```powershell
-winget install --id=astral-sh.uv -e
+winget install --id astral-sh.uv -e
 winget install --id Git.Git -e
 winget install --id Microsoft.Edge -e
 winget install --id Docker.DockerDesktop -e
 ```
 
-安装完成后重新打开 PowerShell，检查命令是否可用：
+## Quick Start
+
+### 1. Clone and install
 
 ```powershell
-uv --version
-git --version
-docker --version
-docker compose version
-```
-
-项目固定使用根目录下的 `.venv`，推荐 Python 3.12。`uv` 会负责安装 Python 和管理该环境，不依赖 Microsoft Store 的 Python 占位程序。
-
-## 2. 下载项目
-
-### 方法一：使用 Git
-
-将下面的 `<项目仓库地址>` 替换为实际 GitHub/Git 仓库地址：
-
-```powershell
-git clone <项目仓库地址> resume-agent
+git clone <YOUR_GITHUB_REPOSITORY_URL> resume-agent
 Set-Location resume-agent
-```
-
-仓库地址通常类似：
-
-```text
-https://github.com/用户名/resume-agent.git
-```
-
-### 方法二：下载 ZIP
-
-在 GitHub 项目页面点击 `Code` → `Download ZIP`，解压后进入项目文件夹。在文件夹空白处按住 Shift 并点击鼠标右键，选择“在终端中打开”。
-
-后续所有命令都必须在包含 `pyproject.toml`、`docker-compose.yml` 和 `app` 文件夹的项目根目录执行。
-
-## 3. 创建项目 Python 环境
-
-在项目根目录执行：
-
-```powershell
 uv python install 3.12
 uv venv --python 3.12 .venv
-```
-
-后续命令统一使用 `uv run`，无需手动激活虚拟环境。若希望激活后直接使用 `python`，可以执行：
-
-```powershell
-.\.venv\Scripts\Activate.ps1
-```
-
-## 4. 安装项目和环境包
-
-### 推荐：安装完整运行环境
-
-```powershell
-uv sync --extra ui --extra mcp --extra documents --extra ocr
-```
-
-这个命令会安装：
-
-- FastAPI、Uvicorn、Pydantic、SQLAlchemy 和 PostgreSQL 驱动；
-- LangChain、LangGraph；
-- Streamlit 网页界面；
-- 标准 MCP SDK 和 Playwright；
-- DOCX、文本型 PDF 解析与导出依赖；
-- PaddleOCR、PaddlePaddle 和 PP-OCRv6 medium 岗位截图识别依赖。
-
-如果还需要运行测试和代码检查，再安装开发依赖：
-
-```powershell
 uv sync --extra ui --extra mcp --extra documents --extra ocr --extra dev
 ```
 
-检查关键依赖：
+If `.venv` already exists, keep it and run only `uv sync ...`; the project does not require recreating or downgrading the environment.
+
+On Windows, uv may report that hardlinks are unavailable and that it is falling back to copies. This is harmless. To suppress the warning for the current terminal:
 
 ```powershell
-uv run python -c "import fastapi, streamlit, langgraph, playwright, paddleocr, paddle; print('Python dependencies OK')"
+$env:UV_LINK_MODE="copy"
+uv sync --extra ui --extra mcp --extra documents --extra ocr --extra dev
 ```
 
-首次使用岗位截图前，下载一次 PP-OCRv6 medium 的检测和识别模型：
-
-```powershell
-uv run python -c "from paddleocr import PaddleOCR; PaddleOCR(text_detection_model_name='PP-OCRv6_medium_det', text_recognition_model_name='PP-OCRv6_medium_rec', use_doc_orientation_classify=False, use_doc_unwarping=False, use_textline_orientation=False, device='cpu', enable_mkldnn=False); print('PP-OCRv6 medium ready')"
-```
-
-模型默认缓存在 `%USERPROFILE%\.paddlex\official_models`。应用只读取已下载的模型，不会在点击识别时静默联网下载。
-
-本项目通过已安装的 Microsoft Edge 工作，不要求使用 Playwright 下载的 Chromium。Edge 路径无法自动识别时，可在网页的“环境与模型”中填写 `msedge.exe` 的完整路径并重新检测。常见路径为：
-
-```text
-C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe
-C:\Program Files\Microsoft\Edge\Application\msedge.exe
-```
-
-## 5. 配置 PostgreSQL
-
-项目采用“PostgreSQL 在 Docker 中运行，其余程序在本机运行”的方式。
-
-### 5.1 创建本地配置
+### 2. Configure and start PostgreSQL
 
 ```powershell
 Copy-Item .env.example .env
-```
-
-默认数据库配置如下：
-
-```text
-数据库地址：127.0.0.1:5433
-数据库名：resume_agent
-用户名：resume
-密码：resume
-```
-
-这些是本地开发默认值。需要修改时，请同时修改 `.env` 和 `docker-compose.yml`。
-
-### 5.2 启动 PostgreSQL
-
-请先启动 Docker Desktop，等待其显示 Docker Engine 已运行，然后执行：
-
-```powershell
 docker compose up -d postgres
 docker compose ps
-```
-
-当 `resume-agent-postgres` 显示 `healthy` 后，初始化数据库：
-
-```powershell
 uv run python -m alembic upgrade head
 ```
 
-只想临时体验且不安装 Docker 时，不要复制 `.env.example`，或删除 `.env` 中的 `RESUME_AGENT_DATABASE_URL`。应用会改用项目 `data/resume_agent.db` 中的 SQLite；然后执行：
+Only PostgreSQL runs in Docker. FastAPI, Streamlit, Edge, MCP child processes, OCR, and models run locally.
+
+For a lightweight trial, omit `RESUME_AGENT_DATABASE_URL` and run `uv run python scripts/init_db.py`; the application then uses `data/resume_agent.db`. PostgreSQL is recommended for durable use.
+
+### 3. Start the backend
 
 ```powershell
-uv run python scripts/init_db.py
-```
-
-SQLite 适合试用和测试，长期使用建议采用 PostgreSQL。
-
-## 6. 配置聊天模型与 Embedding 模型
-
-岗位职责、任职要求和技能会先经过规则解析，再由所选聊天模型做结构化增强；模型输出必须能在 JD 原文中逐字验证，否则会被丢弃。模型不可用时系统会明确提示并保留规则解析结果，不会让岗位详情丢失。
-
-### 6.1 云端 OpenAI-compatible 聊天模型
-
-打开网页第一栏“环境与模型” → “云端聊天模型（OpenAI 兼容）”，依次填写：
-
-| 配置项 | 示例 | 是否持久化 |
-| --- | --- | --- |
-| Base URL | `https://api.openai.com/v1` 或服务商给出的兼容地址 | 是 |
-| 聊天模型名称 | 服务商实际支持的模型 ID | 是 |
-| API Key | 服务商控制台创建的密钥 | 否，仅在后端进程内存暂存 |
-| 外部模型数据发送确认 | 首次使用时勾选 | 是，可在设置中撤销 |
-
-点击“保存并检测连接”。检测成功后，该配置会成为默认聊天模型，并可用于 JD 解析和项目经历生成。Base URL 与模型名称属于非敏感配置，会保存到 PostgreSQL/本地数据库；API Key 不写入 `.env`、数据库、日志或备份，后端重启后需要重新填写。不要把 API Key 填入 `.env.example` 或提交到 Git。
-
-### 6.2 Ollama 本地模型
-
-不使用本地模型时可以跳过本节，直接使用上面的云端 OpenAI 兼容接口。
-
-安装 Ollama：
-
-```powershell
-winget install --id Ollama.Ollama -e
-```
-
-重新打开 PowerShell，下载默认聊天模型和 embedding 模型：
-
-```powershell
-ollama pull qwen2.5:7b
-ollama pull bge-m3
-ollama list
-```
-
-如果 Ollama 没有自动运行，可以在单独的终端执行：
-
-```powershell
-ollama serve
-```
-
-本地聊天模型与 embedding 模型分别检测。网页只会列出本机真正下载的模型，不会自动下载模型。
-
-网页会分别检测本地聊天模型和 Embedding 模型。点击“扫描 Ollama 已下载模型”只读取本机已有模型，不会自动下载；选择模型后还需点击“检测”，状态为“正常”后才会用于智能体流程。
-
-## 7. 启动项目
-
-FastAPI 和 Streamlit 需要分别在两个 PowerShell 窗口中运行。两个窗口都要进入项目目录；`uv run` 会自动使用项目中的同一个 `.venv`。
-
-### 终端一：启动 FastAPI 后端
-
-```powershell
-Set-Location <项目目录>\resume-agent
 uv run python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
-看到下面的信息表示后端已启动：
+FastAPI owns both FastMCP `stdio` processes. Do not launch the BOSS or GitHub MCP server separately.
 
-```text
-Uvicorn running on http://127.0.0.1:8000
-```
+### 4. Start the web UI
 
-FastAPI 会自动启动和管理 BOSS MCP、GitHub MCP 子进程，不要再手动启动两个 MCP 服务。
-
-### 终端二：启动 Streamlit 网页
+Open a second PowerShell window in the repository:
 
 ```powershell
-Set-Location <项目目录>\resume-agent
 uv run python -m streamlit run app/ui/streamlit_app.py --server.address 127.0.0.1 --server.port 8666
 ```
 
-浏览器访问：
+Open:
 
-```text
-http://127.0.0.1:8666
-```
+- Web UI: <http://127.0.0.1:8666>
+- API health: <http://127.0.0.1:8000/api/health>
+- OpenAPI: <http://127.0.0.1:8000/docs>
 
-后端健康检查和 API 文档地址：
+## Stop, Restart, and Preserve Data
 
-```text
-http://127.0.0.1:8000/api/health
-http://127.0.0.1:8000/docs
-```
+Use a graceful shutdown so the app can close every tab in its isolated collection Edge profile and avoid an Edge “Restore pages” prompt on the next launch.
 
-项目只监听本机回环地址 `127.0.0.1`，默认不会开放给局域网或互联网。
-
-## 8. 首次使用顺序
-
-1. 打开 `http://127.0.0.1:8666`。
-2. 在“环境与模型”中点击 Edge 检测和 Ollama 扫描。
-3. 选择并检测聊天模型；需要时再检测 embedding 模型。
-4. 进入“简历项目向导”，先选择是否上传已有简历；不上传时再选择模板完整简历或纯文本项目。
-5. 选择岗位截图、BOSS 岗位 URL 或“岗位名称 + 城市”获取 JD。截图可以在粘贴框聚焦后按 `Ctrl+V` 直接粘贴，也可选择本地图片上传。
-6. 使用自动搜索时，系统会打开独立的可见 Edge；首次使用需在该窗口手动登录 BOSS。
-7. 登录完成后回到网页，再次点击搜索。搜索和翻页期间不要关闭岗位采集 Edge。
-8. 使用“上一页/下一页”浏览岗位。若 BOSS 暂未返回新的懒加载卡片，“下一页”会保持可点，可再次触发下拉加载；只有页面明确提示到底时才禁用。
-9. 列表展示 HR 的“在线/活跃时间待解析”状态；在采集 Edge 打开岗位或解析详情后，会读取详情页异步展示的“刚刚活跃、本周活跃”等状态并回写列表。
-10. 截图 OCR 完成后先校正识别文字并确认；确认前不会创建岗位或启动项目生成。
-11. 确认 JD、生成项目候选并逐项核实模型推导内容。
-12. 已上传简历时选择“仅新增/替换项目”或“生成完整简历”；模板模式生成完整简历，纯文本模式直接输出可复制项目。
-
-系统不会绕过验证码、滑块或登录限制。如果 BOSS 出现人工验证，请在保留的 Edge 窗口完成后重新点击相应操作。
-
-## 9. 检查服务状态
-
-在新的 PowerShell 中执行：
-
-```powershell
-Invoke-RestMethod http://127.0.0.1:8000/api/health
-Invoke-WebRequest http://127.0.0.1:8666/_stcore/health -UseBasicParsing
-docker compose ps
-```
-
-第二条命令返回 `ok` 表示 Streamlit 正常。
-
-## 10. 停止服务
-
-在 FastAPI 和 Streamlit 所在的两个终端中分别按 `Ctrl+C`。
-
-停止 PostgreSQL 容器：
+1. In the web UI, click **Restart** if a BOSS collection session is open. The backend closes detail/user tabs one by one and closes the retained search tab last.
+2. In the Streamlit PowerShell window, press `Ctrl+C`.
+3. In the FastAPI PowerShell window, press `Ctrl+C`. FastAPI's shutdown hook also closes the BOSS MCP process and all app-owned Edge tabs, so this step is the final browser cleanup fallback.
+4. Stop PostgreSQL when it is no longer needed:
 
 ```powershell
 docker compose stop postgres
 ```
 
-再次使用时执行：
+To start again, run `docker compose up -d postgres`, then start FastAPI and Streamlit with the commands above. `docker compose stop` preserves all database data. `docker compose down` removes the container and network but keeps the named volume; **do not run `docker compose down -v` unless you intentionally want to delete all PostgreSQL data**.
+
+If a terminal is forcibly killed, start the backend once and use **Restart** before closing it normally. The application never closes the user's everyday Edge profile—only the isolated process recorded under `data/edge-profile`.
+
+## What PostgreSQL Does
+
+PostgreSQL is the durable workflow store, not a model runtime or file store. It keeps:
+
+- tasks, `thread_id`, LangGraph checkpoint versions, node state, leases, and recovery metadata;
+- parsed job/JD and resume structures, model profile metadata, candidate versions, feedback, user confirmations, and module decisions;
+- field-level patch/audit records, old-value hashes, snapshot references, and export metadata.
+
+Uploaded resumes, OCR images, generated artifacts, the authenticated Edge profile, and encrypted API-key material stay under the private local `data/` tree rather than inside Git. API keys are not stored in PostgreSQL: only a non-secret profile/credential reference is persisted, while the encrypted secret remains machine-local. The PostgreSQL container may be stopped without losing state; data is lost only if its named volume is explicitly deleted or the database is otherwise removed.
+
+## Model Setup
+
+Configure models in the first page of the UI.
+
+### OpenAI-compatible providers
+
+Enter the provider's base URL, exact model ID, and API key, then click the connection test button.
+
+- Use a base URL ending in `/v1`, for example `https://api.openai.com/v1`.
+- A pasted `/chat/completions` URL is normalized back to the API root.
+- Chat and embedding profiles are configured separately and may use different providers or keys.
+- Select `Bearer Key` unless the provider explicitly requires the raw key in `Authorization`.
+- The API key is encrypted locally and restored for later calls; the UI shows only a mask.
+- External-model consent is requested once before resume or JD content is sent.
+
+### Ollama
 
 ```powershell
-docker compose up -d postgres
-```
-
-`docker compose down` 会删除容器但保留命名数据卷。不要执行 `docker compose down -v`，除非确定需要删除全部 PostgreSQL 数据。
-
-## 11. 更新项目
-
-使用 Git 下载的项目可以这样更新：
-
-```powershell
-git pull
-uv sync --extra ui --extra mcp --extra documents --extra ocr
-uv run python -m alembic upgrade head
-```
-
-更新后重新启动 FastAPI 和 Streamlit。
-
-## 12. 测试
-
-安装 `dev` 依赖后执行：
-
-```powershell
-$env:PYTHONPATH=(Get-Location).Path
-uv run python -m compileall -q app
-uv run python -m unittest discover -s tests
-uv run python scripts/smoke_test.py
-```
-
-## 13. 常见问题
-
-### PowerShell 不允许激活虚拟环境
-
-仅为当前终端临时放行：
-
-```powershell
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-.\.venv\Scripts\Activate.ps1
-```
-
-### PostgreSQL 无法连接
-
-```powershell
-docker compose ps
-docker compose logs postgres
-Test-NetConnection 127.0.0.1 -Port 5433
-```
-
-确认 Docker Desktop 已启动，容器状态为 `healthy`，且 `.env` 中端口为 `5433`。
-
-### 8000 或 8666 端口被占用
-
-```powershell
-Get-NetTCPConnection -State Listen -LocalPort 8000,8666
-```
-
-如果后端改用其他端口，例如 `8010`，启动网页前需要同时指定后端地址：
-
-```powershell
-$env:RESUME_AGENT_API_URL="http://127.0.0.1:8010"
-uv run python -m streamlit run app/ui/streamlit_app.py --server.address 127.0.0.1 --server.port 8666
-```
-
-### Edge 检测失败
-
-先确认 Edge 已安装，再在“环境与模型”中填写 `msedge.exe` 完整路径并保存、重新检测。BOSS 操作必须使用应用创建的岗位采集 Edge，不要使用系统默认浏览器替代。
-
-### Ollama 显示没有模型
-
-```powershell
-ollama list
+winget install --id Ollama.Ollama -e
 ollama pull qwen2.5:7b
 ollama pull bge-m3
+ollama list
 ```
 
-下载完成后回到网页重新扫描。
+Start `ollama serve` if the service is not already running. The UI reads the live Ollama model list and lets you select real installed chat and embedding models independently. It never silently downloads a model.
 
-### 岗位截图识别失败
+## Screenshot OCR
 
-确认已经使用 `--extra ocr` 安装依赖，并执行第 4 节中的模型下载命令。支持 PNG、JPG/JPEG、WEBP、BMP，单张不超过 10 MB。Windows 上使用 PaddlePaddle 3.3 时应用会关闭 oneDNN，避免 PP-OCRv6 medium 的 PIR 属性转换错误。若提示模型文件无权限，请确认当前 Windows 用户对 `%USERPROFILE%\.paddlex\official_models\PP-OCRv6_medium_det` 和 `PP-OCRv6_medium_rec` 具有“读取和执行”权限。
-
-## 14. 数据与隐私
-
-- API Key 和 GitHub Token 不写入配置、数据库、日志或备份。
-- BOSS 使用独立 Edge profile；Windows 默认保存在 `%LOCALAPPDATA%\ResumeAgent\edge-profile`，避免 Desktop 目录权限导致 Edge 渲染/调试进程退出。登录态只保留在本机。
-- 简历上传限制为 10 MB、最多 3 页；PDF 必须包含可复制文本，当前不做 OCR。
-- 岗位截图只在内存中交给本地 PaddleOCR；图片不写入磁盘。OCR 文字暂存 30 分钟，只有用户校正确认后才创建岗位记录。
-- 模型根据 JD 推导的经历默认标记为待核实，用户确认前不会正式写入简历。
-- 修改简历使用字段级补丁和旧值哈希校验，避免覆盖用户手动修改的内容。
-- 默认日志保留 30 天，应用仅供本地单机使用。
-
-### 14.1 发布到 GitHub 前的隐私检查
-
-仓库的 `.gitignore` 已排除以下高风险本地内容：
-
-- `.env`、私钥和 Streamlit secrets；
-- `data/` 下的数据库、内部令牌、岗位/任务记录、上传简历、偏好 Skill、备份与缓存模板；
-- BOSS 专用 Edge profile、Cookie、登录状态和 CDP 文件；
-- `photos/`、`output/`、导出文件、预览文件、DOCX/PDF 和本地简历 Markdown；
-- 日志、Python 缓存、虚拟环境和编辑器配置。
-
-`.env.example` 是可以提交的配置模板，里面只能保留占位值或本地开发默认值，不能填写真实 API Key、GitHub Token、个人数据库密码或个人路径。克隆项目后，每位用户应自行执行：
+Install the `ocr` extra, then pre-download PP-OCRv6 medium once:
 
 ```powershell
-Copy-Item .env.example .env
+uv run python -c "from paddleocr import PaddleOCR; PaddleOCR(text_detection_model_name='PP-OCRv6_medium_det', text_recognition_model_name='PP-OCRv6_medium_rec', use_doc_orientation_classify=False, use_doc_unwarping=False, use_textline_orientation=False, device='cpu', enable_mkldnn=False); print('PP-OCRv6 medium ready')"
 ```
 
-然后按实际环境修改 `.env` 中的数据库地址、数据目录、端口、Ollama 地址、默认本地模型和 Edge 路径（可选）。云端模型的 Base URL、模型名和 API Key 请在网页第一栏填写，其中 API Key 不应放进 `.env`。
+Models are normally cached under `%USERPROFILE%\.paddlex\official_models`. The application accepts pasted or uploaded PNG, JPEG, WEBP, and BMP files up to 10 MB. If model enhancement fails, the confirmed OCR text and rule result stay available for correction and retry.
 
-首次公开仓库前执行以下只读检查：
+## BOSS Collection Behavior
+
+- Uses a dedicated Edge profile under `data/edge-profile`; it never attaches to the user's everyday Edge profile.
+- Login, CAPTCHA, slider, and risk-control steps are always completed manually.
+- The collection window stays minimized after login. Detail parsing creates a background Chromium target and does not take focus.
+- Results are fetched in batches of 10. “Next page” restores the retained search tab, scrolls to the last collected card, dispatches trusted wheel input, skips survey/promotional nodes, and retries delayed lazy loading.
+- “View in collection Edge” is an explicit foreground action. Later pagination returns to the retained search target even if another tab is active.
+- “Restart” closes only the app-owned collection Edge and clears the wizard state.
+- Normal backend shutdown applies the same cleanup: every app-owned tab is closed individually before the recorded Edge process exits.
+- The application does not bypass BOSS controls and cannot guarantee compatibility with future site changes.
+
+## Resume and Template Rules
+
+- One primary resume per task.
+- Text-based PDFs only, up to 10 MB and 3 pages.
+- Uploaded resume and selected template structures must be model-parsed, edited if needed, and explicitly confirmed.
+- GitHub templates are restricted to Chinese resume files with an allowed license; the picker attempts to provide five high-star/relevant candidates and falls back to the built-in template when needed.
+- Model-derived technical plans or claims stay marked `[待核实]` until the user confirms every required field.
+- Resume changes are field-level patches. The backend checks both checkpoint version and old-value hash before applying them.
+- If a resume exceeds one page, layout compression is proposed first; content rewriting requires separate user consent.
+
+## Export
+
+The completed task page supports:
+
+| Format | Preview | Download |
+| --- | --- | --- |
+| Markdown | Editable/copyable text | `.md` |
+| DOCX | Text plus converted PDF visual preview when Word/LibreOffice is available | `.docx` |
+| PDF | Embedded page preview | `.pdf` |
+
+Artifacts are served only through task-scoped authenticated endpoints. The UI never trusts an arbitrary filesystem path.
+
+## Configuration
+
+Copy the tracked placeholder file `.env.example` to the ignored machine-local `.env`, then edit only the values needed for this computer. `.env.example` contains no real credentials and is the configuration template that should remain in Git. Important variables:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_PORT` | local development values | PostgreSQL container settings; keep `RESUME_AGENT_DATABASE_URL` in sync |
+| `RESUME_AGENT_DATABASE_URL` | PostgreSQL example in `.env.example` | SQLAlchemy database URL |
+| `RESUME_AGENT_DATA_ROOT` | `./data` | Private runtime files |
+| `RESUME_AGENT_API_HOST` | `127.0.0.1` | API bind address |
+| `RESUME_AGENT_API_PORT` | `8000` | API port |
+| `RESUME_AGENT_EDGE_PATH` | auto-detect | Optional `msedge.exe` path |
+| `RESUME_AGENT_OLLAMA_BASE_URL` | `http://127.0.0.1:11434` | Ollama endpoint |
+| `RESUME_AGENT_TASK_TIMEOUT_SECONDS` | `300` | Default task timeout |
+| `RESUME_AGENT_LOG_RETENTION_DAYS` | `30` | Local log retention |
+
+Do not place cloud API keys or GitHub tokens in `.env`. Cloud model keys are entered in the UI and encrypted locally; GitHub tokens are session-only.
+
+The Compose file binds PostgreSQL to `127.0.0.1` only. Change the example database password before using this beyond a single trusted development machine, and URL-encode special characters when copying it into `RESUME_AGENT_DATABASE_URL`.
+
+## Privacy Before Publishing to GitHub
+
+The repository `.gitignore` excludes:
+
+- `.env`, Streamlit secrets, certificates, and keys;
+- `data/`, local databases, encrypted credential files, logs, backups, and the Edge profile;
+- uploaded resumes, PDFs, DOCX files, screenshots, previews, and exports;
+- `.venv`, `.run/` process logs, caches, editor/agent metadata, and generated package metadata.
+
+Before the first push, still inspect staged files:
 
 ```powershell
 git status --short
-git ls-files .env data photos output
-git grep -n -I -E "(api[_-]?key|github[_-]?token|authorization|password|BEGIN .*PRIVATE KEY)"
+git diff --cached --check
+git diff --cached
 ```
 
-如果 `.env`、`data/`、浏览器 profile、简历或截图在完善 `.gitignore` 之前已经被 Git 跟踪，仅增加忽略规则不会自动移除历史索引。确认目标无误后，可只从 Git 索引移除而保留本地文件：
+Never commit a real resume, API key, GitHub token, browser profile, cookie, database, or generated artifact.
+
+## Tests
 
 ```powershell
-git rm --cached .env
-git rm -r --cached data photos output
+uv run python -m pytest -q
+uv run python -m compileall -q app tests
+uv run python -m ruff check --select E9,F63,F7,F82 app tests
 ```
 
-如敏感内容已经推送到远程仓库，应立即吊销并更换相关密钥；仅删除最新提交中的文件不能清除 Git 历史。数据库默认密码只适合监听本机的开发环境，若修改端口映射或对外开放 PostgreSQL，必须同步更换 `docker-compose.yml` 与 `.env` 中的凭据。
+## Troubleshooting
+
+<details>
+<summary>Cloud model connects once, then later calls fail</summary>
+
+Save and probe the profile once in the UI. The encrypted machine-local secret store will rematerialize the credential handle for later JD, template, resume, and generation calls. If the machine key or encrypted file was manually removed, enter the key once again.
+</details>
+
+<details>
+<summary>BOSS “Next page” has not produced a new batch</summary>
+
+Keep the app-owned Edge process running. The UI automatically retries a delayed lazy-load cycle and preserves the cursor when BOSS has not emitted an explicit end marker. If BOSS asks for login or verification, complete it manually and submit the search again.
+</details>
+
+<details>
+<summary>DOCX exists but PDF visual preview is unavailable</summary>
+
+Install Microsoft Word or LibreOffice and restart the backend. Markdown and DOCX downloads remain available when conversion is unavailable; PDF export reports the missing dependency instead of returning a fake file.
+</details>
+
+<details>
+<summary>GitHub template download times out</summary>
+
+Check DNS, firewall, system proxy, `github.com`, and `raw.githubusercontent.com`. A temporary GitHub token can reduce rate limits but is not persisted. The built-in Chinese template remains available.
+</details>
+
+## Repository Layout
+
+```text
+app/
+  core/       schemas, persistence, model gateway, encrypted secret store
+  mcp/        FastMCP BOSS and GitHub servers, Edge adapter, MCP client
+  services/   parsing, matching, generation, workflow, templates, export
+  ui/         Streamlit application and clipboard components
+alembic/      PostgreSQL migrations
+docs/         executable technical design
+scripts/      database initialization and smoke tests
+tests/        unit, API, persistence, MCP, workflow, and export tests
+```
+
+## Roadmap
+
+- Implement the reserved company-career-site adapter.
+- Add more layout-preserving template adapters and export renderers.
+- Add packaged releases and CI once a public repository URL is established.
+- Add multi-machine deployment only after the local privacy model is retained.
+
+## Contributing
+
+Issues and pull requests are welcome after the repository is published. Please keep changes local-first, do not weaken confirmation or conflict checks, add tests for workflow changes, and never include real credentials or resumes in fixtures.
+
+## License
+
+No open-source license has been declared yet. Until a `LICENSE` file is added, the source is visible but reuse, modification, and redistribution rights are not granted automatically. Choose and add an appropriate license before announcing the repository as open source.

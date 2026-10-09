@@ -92,6 +92,7 @@ class DatabaseContractTests(unittest.TestCase):
         job = JobInput(
             title="AI 应用工程师",
             city="深圳",
+            hr_name="李女士",
             hr_activity="本周活跃",
             responsibilities=["负责智能体应用开发"],
         )
@@ -100,6 +101,7 @@ class DatabaseContractTests(unittest.TestCase):
         loaded = dict(self.mirror.load_jobs())
 
         self.assertEqual(loaded["job-hr-activity"].hr_activity, "本周活跃")
+        self.assertEqual(loaded["job-hr-activity"].hr_name, "李女士")
 
     def test_task_binds_immutable_profile_versions_and_rejects_missing_binding(self) -> None:
         _, job, snapshot_id, chat, embedding = self._job_and_profiles()

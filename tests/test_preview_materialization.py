@@ -55,6 +55,13 @@ class PreviewMaterializationTests(unittest.TestCase):
                     content="Replace this project body",
                     value_hash=sha256_text("Replace this project body"),
                 ),
+                ResumeSection(
+                    section_id="education-1",
+                    module="education",
+                    title="Education",
+                    content="Original education",
+                    value_hash=sha256_text("Original education"),
+                ),
             ],
             raw_text="source",
         )
@@ -87,6 +94,8 @@ class PreviewMaterializationTests(unittest.TestCase):
         self.assertIn("Keep this project body", rendered)
         self.assertNotIn("Replace this project body", rendered)
         self.assertIn("Generated Project", rendered)
+        self.assertEqual(rendered.count("Generated Project"), 1)
+        self.assertNotIn("## 候选项目", rendered)
 
     def test_add_preserves_all_existing_projects(self) -> None:
         task = self._task(
@@ -101,6 +110,7 @@ class PreviewMaterializationTests(unittest.TestCase):
         self.assertIn("Keep this project body", rendered)
         self.assertIn("Replace this project body", rendered)
         self.assertIn("Generated Project", rendered)
+        self.assertLess(rendered.index("Generated Project"), rendered.index("Original education"))
 
     def test_confirmed_module_patch_changes_only_its_target(self) -> None:
         task = self._task(

@@ -9,9 +9,15 @@ from fastapi.testclient import TestClient
 from app.core.schemas import ModelProfile, ModelRole, Provider, TaskStatus
 from app.core.store import TaskRecord
 from app.main import app
+from app.services.feedback import classify_feedback
 
 
 class FeedbackModelSwitchTests(unittest.TestCase):
+    def test_unfamiliar_but_non_conflicting_feedback_does_not_pause(self) -> None:
+        result = classify_feedback("这几个候选太普通了，请换一个更贴近业务的写法")
+
+        self.assertFalse(result.requires_clarification)
+
     def _task(self) -> TaskRecord:
         suffix = uuid.uuid4().hex
         return TaskRecord(
@@ -72,38 +78,41 @@ class FeedbackModelSwitchTests(unittest.TestCase):
 
     def test_external_switch_requires_scoped_credential_and_consent(self) -> None:
         with TestClient(app) as client:
-            task = self._task()
-            app.state.resume.store.create_task(task)
-            profile = ModelProfile(
-                profile_id=f"external-{uuid.uuid4().hex}",
-                role=ModelRole.CHAT,
-                provider=Provider.OPENAI_COMPATIBLE,
-                base_url="https://model.example.test/v1",
-                model_name="chat-model",
-                status="ready",
-                credential_required=True,
-            )
-            app.state.resume.store.seed_profile(profile)
+            # A developer's persisted global consent must not make this
+            # contract test depend on local database state.
+            with patch.dict(app.state.resume.consents, {}, clear=True):
+                task = self._task()
+                app.state.resume.store.create_task(task)
+                profile = ModelProfile(
+                    profile_id=f"external-{uuid.uuid4().hex}",
+                    role=ModelRole.CHAT,
+                    provider=Provider.OPENAI_COMPATIBLE,
+                    base_url="https://model.example.test/v1",
+                    model_name="chat-model",
+                    status="ready",
+                    credential_required=True,
+                )
+                app.state.resume.store.seed_profile(profile)
 
-            missing = self._post(client, task, chat_profile_id=profile.profile_id)
-            wrong_handle = app.state.resume.credentials.put(
-                "secret-not-persisted", scope="model:another-profile", ttl_seconds=300
-            )
-            wrong_scope = self._post(
-                client,
-                task,
-                chat_profile_id=profile.profile_id,
-                credential_handle_id=wrong_handle.handle_id,
-            )
-            valid_handle = app.state.resume.credentials.put(
-                "secret-not-persisted", scope=f"model:{profile.profile_id}", ttl_seconds=300
-            )
-            consent_required = self._post(
-                client,
-                task,
-                chat_profile_id=profile.profile_id,
-                credential_handle_id=valid_handle.handle_id,
-            )
+                missing = self._post(client, task, chat_profile_id=profile.profile_id)
+                wrong_handle = app.state.resume.credentials.put(
+                    "secret-not-persisted", scope="model:another-profile", ttl_seconds=300
+                )
+                wrong_scope = self._post(
+                    client,
+                    task,
+                    chat_profile_id=profile.profile_id,
+                    credential_handle_id=wrong_handle.handle_id,
+                )
+                valid_handle = app.state.resume.credentials.put(
+                    "secret-not-persisted", scope=f"model:{profile.profile_id}", ttl_seconds=300
+                )
+                consent_required = self._post(
+                    client,
+                    task,
+                    chat_profile_id=profile.profile_id,
+                    credential_handle_id=valid_handle.handle_id,
+                )
 
             self.assertEqual(missing.status_code, 409)
             self.assertEqual(missing.json()["error_code"], "needs_credentials")

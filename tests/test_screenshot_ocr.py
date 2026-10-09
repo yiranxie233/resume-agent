@@ -63,6 +63,28 @@ class ScreenshotOCRServiceTests(unittest.TestCase):
         self.assertEqual(lines[1]["score"], 0.95)
         self.assertEqual(lines[1]["box"], [0, 11, 80, 22])
 
+    def test_detector_batch_output_is_sorted_into_reading_order(self) -> None:
+        lines = extract_ocr_lines(
+            {
+                "rec_texts": ["第二行", "第一行右", "第一行左"],
+                "rec_scores": [0.9, 0.9, 0.9],
+                "rec_boxes": [[0, 30, 80, 45], [120, 5, 200, 20], [0, 5, 80, 20]],
+            }
+        )
+
+        self.assertEqual([item["text"] for item in lines], ["第一行左", "第一行右", "第二行"])
+
+    def test_small_vertical_jitter_stays_on_the_same_visual_row(self) -> None:
+        lines = extract_ocr_lines(
+            {
+                "rec_texts": ["第一行右", "第一行左", "第二行"],
+                "rec_scores": [0.9, 0.9, 0.9],
+                "rec_boxes": [[120, 6, 200, 22], [0, 4, 80, 20], [0, 35, 80, 51]],
+            }
+        )
+
+        self.assertEqual([item["text"] for item in lines], ["第一行左", "第一行右", "第二行"])
+
     def test_recognize_uses_v6_medium_result_without_disk_file(self) -> None:
         service = PaddleScreenshotOCR()
         service._model = _FakeModel()
@@ -105,6 +127,7 @@ class ScreenshotOCRApiTests(unittest.IsolatedAsyncioTestCase):
             pending_ocr_lock=threading.RLock(),
             store=InMemoryStore(),
             db_mirror=None,
+            job_parse_confirmations={},
         )
         upload = UploadFile(filename="job.png", file=io.BytesIO(_png_bytes()))
 
@@ -131,7 +154,48 @@ class ScreenshotOCRApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(confirmed["ocr_text_changed"])
         self.assertEqual(confirmed["job"]["hr_activity"], "在线")
         self.assertEqual(len(app_state.store.list_jobs()), 1)
-        self.assertNotIn(staged["ocr_id"], app_state.pending_ocr)
+        self.assertIn(staged["ocr_id"], app_state.pending_ocr)
+        self.assertIn(
+            "confirmed_response", app_state.pending_ocr[staged["ocr_id"]]
+        )
+        self.assertTrue(confirmed["model_fallback"])
+        self.assertIn("无需再次上传截图", confirmed["model_fallback_message"])
+        self.assertIn("负责 Python 智能体开发", confirmed["job"]["raw_text"])
+
+        with patch("app.main.state", return_value=app_state):
+            replayed = await confirm_job_screenshot(
+                ScreenshotConfirmRequest(
+                    ocr_id=staged["ocr_id"],
+                    text=(staged["text"] + "\n技能要求：LangGraph"),
+                ),
+                None,
+            )
+        self.assertTrue(replayed["confirmation_replayed"])
+        self.assertEqual(replayed["job_id"], confirmed["job_id"])
+        self.assertEqual(len(app_state.store.list_jobs()), 1)
+
+    async def test_expired_backend_stage_recovers_from_client_ocr_text(self) -> None:
+        app_state = SimpleNamespace(
+            pending_ocr={},
+            pending_ocr_lock=threading.RLock(),
+            store=InMemoryStore(),
+            db_mirror=None,
+            job_parse_confirmations={},
+        )
+
+        with patch("app.main.state", return_value=app_state):
+            confirmed = await confirm_job_screenshot(
+                ScreenshotConfirmRequest(
+                    ocr_id="ocr_expired_after_restart",
+                    text="岗位职责\n负责智能体服务开发\n任职要求\n熟悉 Python",
+                ),
+                None,
+            )
+
+        self.assertEqual(confirmed["status"], "ready")
+        self.assertTrue(confirmed["model_fallback"])
+        self.assertIn("ocr_expired_after_restart", app_state.pending_ocr)
+        self.assertEqual(len(app_state.store.list_jobs()), 1)
 
     async def test_oversized_upload_is_rejected_before_ocr(self) -> None:
         app_state = SimpleNamespace(

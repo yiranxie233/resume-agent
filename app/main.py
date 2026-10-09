@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import re
@@ -19,7 +20,7 @@ from fastapi import Body, Depends, FastAPI, File, Header, HTTPException, Query, 
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from app.core.config import Settings, get_settings
 from app.core.database_store import DatabaseMirror
@@ -45,9 +46,14 @@ from app.core.schemas import (
     TaskView,
 )
 from app.core.store import InMemoryStore, TaskRecord, VersionConflict
+from app.core.secret_store import EncryptedSecretStore, SecretStoreUnavailable
 from app.services.job_llm_parser import enhance_job_with_model, rule_fallback_metadata
-from app.services.job_parser import job_from_text, parse_job_detail_text, validate_boss_url
+from app.services.job_parser import infer_job_metadata, job_from_text, parse_job_detail_text, validate_boss_url
 from app.services.resume_parser import ResumeParseError, parse_resume_bytes
+from app.services.resume_llm_parser import (
+    resume_rule_fallback_metadata,
+    structure_resume_with_model,
+)
 from app.services.screenshot_parser import (
     MAX_SCREENSHOT_BYTES,
     PaddleScreenshotOCR,
@@ -55,9 +61,12 @@ from app.services.screenshot_parser import (
 )
 from app.services.export_service import (
     compress_markdown,
+    convert_docx_to_pdf,
     convert_pdf_with_libreoffice,
     estimate_pages,
     export_docx,
+    export_text_pdf,
+    render_candidate_project,
     render_markdown,
     write_preview,
 )
@@ -67,7 +76,13 @@ from app.services.template_service import (
     check_github_template_update,
     preview_cached_template,
     preview_github_template,
+    render_docx_html_preview,
     search_github_templates,
+)
+from app.services.template_llm_parser import (
+    confirm_template_structure,
+    load_template_structure,
+    structure_template_with_model,
 )
 from app.services.skill_service import list_skill_versions, read_skill, rollback_skill as rollback_skill_file, save_skill
 from app.services.workflow import WorkflowEngine
@@ -89,6 +104,11 @@ def _gateway_profile(profile: ModelProfile):
         temperature=float(profile.generation_params.get("temperature", 0.2)),
         top_p=float(profile.generation_params.get("top_p", 1.0)),
         max_output_tokens=int(profile.generation_params.get("max_output_tokens", 1200)),
+        timeout_seconds=float(profile.generation_params.get("timeout_seconds", 120.0)),
+        max_retries=int(profile.generation_params.get("max_retries", 1)),
+        retry_interval_seconds=float(
+            profile.generation_params.get("retry_interval_seconds", 0.5)
+        ),
     )
     embedding = EmbeddingParameters(max_input_tokens=profile.max_input_tokens)
     return GatewayProfile(
@@ -99,6 +119,7 @@ def _gateway_profile(profile: ModelProfile):
         model_name=profile.model_name,
         profile_version=f"v{profile.config_version}",
         credential_required=profile.credential_required,
+        auth_scheme=str(profile.generation_params.get("auth_scheme") or "bearer"),
         context_window_tokens=profile.context_window_tokens,
         tokenizer_id=profile.tokenizer_id,
         tokenizer_version=profile.tokenizer_version,
@@ -165,10 +186,20 @@ class AppState:
         # digest live briefly in process memory until the user confirms it.
         self.pending_ocr: dict[str, dict[str, Any]] = {}
         self.pending_ocr_lock = threading.RLock()
+        self.job_parse_confirmations: dict[str, bool] = {}
         from app.core.model_gateway import CredentialStore
 
         self.credentials = CredentialStore()
+        self.secret_store = EncryptedSecretStore(
+            self.settings.data_root / "credentials" / "model-secrets.json"
+        )
         self.credential_scopes: dict[str, set[str]] = {"model": set(), "github": set()}
+        # Profile-to-handle bindings are process-local only.  They let every
+        # model operation reuse a saved API key without asking Streamlit to
+        # keep an opaque handle alive across reruns.  The map never contains
+        # plaintext and is rebuilt from the encrypted machine-local store.
+        self.model_credential_handles: dict[str, str] = {}
+        self.credential_registry_lock = threading.RLock()
         from app.core.model_gateway import ModelGateway
 
         # One gateway owns the process-local credential store and is shared by
@@ -187,7 +218,8 @@ class AppState:
         self.mcp_startup_errors: dict[str, str] = {}
         self.mcp_start_task: asyncio.Task[Any] | None = None
         # Consent contains no credential material and is persisted separately.
-        # API keys and GitHub tokens remain process-local in ``CredentialStore``.
+        # Model API keys may be recovered from the machine-local encrypted
+        # store into short-lived handles; GitHub tokens remain process-local.
         self.consents: dict[str, dict[str, Any]] = {}
         self.skill_versions: list[dict[str, Any]] = []
         self.skill_path = self.settings.data_root / "skills" / "resume-preferences.md"
@@ -236,6 +268,26 @@ class AppState:
                 # A corrupt/partial row must not prevent setup mode from
                 # starting; the database mirror reports the degraded state.
                 self.db_mirror.available = False
+        # Restore one live handle per saved external-model profile at startup.
+        # Failure to decrypt one legacy entry is isolated to that profile and
+        # is reported by /api/credentials/stored/{profile_id}; it must not stop
+        # the rest of the local application from starting.
+        for profile in self.store.list_profiles():
+            if profile.provider is not Provider.OPENAI_COMPATIBLE:
+                continue
+            try:
+                secret = self.secret_store.get(profile.profile_id)
+                if not secret:
+                    continue
+                handle = self.credentials.put(
+                    secret,
+                    scope=f"model:{profile.profile_id}",
+                    ttl_seconds=31536000,
+                )
+            except (SecretStoreUnavailable, TypeError, ValueError):
+                continue
+            self.model_credential_handles[profile.profile_id] = handle.handle_id
+            self.credential_scopes["model"].add(handle.handle_id)
         self.workflow = WorkflowEngine(
             self.store,
             self.db_mirror,
@@ -467,6 +519,54 @@ def state() -> AppState:
     return app.state.resume
 
 
+def _materialize_model_credential(
+    profile_id: str,
+    handle_id: str | None = None,
+) -> str | None:
+    """Return a live handle, restoring the machine-local encrypted secret if needed."""
+
+    app_state = state()
+    profile_id = str(profile_id or "").strip()
+    if not profile_id:
+        return None
+    scope = f"model:{profile_id}"
+    registry = getattr(app_state, "model_credential_handles", None)
+    registry_lock = getattr(app_state, "credential_registry_lock", None)
+
+    def resolve() -> str | None:
+        active_handle = registry.get(profile_id) if isinstance(registry, dict) else None
+        if active_handle and app_state.credentials.has(active_handle, scope=scope):
+            return active_handle
+        if isinstance(registry, dict):
+            registry.pop(profile_id, None)
+        if active_handle:
+            app_state.credential_scopes.setdefault("model", set()).discard(active_handle)
+        if handle_id and app_state.credentials.has(handle_id, scope=scope):
+            if isinstance(registry, dict):
+                registry[profile_id] = handle_id
+            app_state.credential_scopes.setdefault("model", set()).add(handle_id)
+            return handle_id
+        secret_store = getattr(app_state, "secret_store", None)
+        if secret_store is None:
+            return None
+        try:
+            secret = secret_store.get(profile_id)
+        except SecretStoreUnavailable:
+            return None
+        if not secret:
+            return None
+        handle = app_state.credentials.put(secret, scope=scope, ttl_seconds=31536000)
+        if isinstance(registry, dict):
+            registry[profile_id] = handle.handle_id
+        app_state.credential_scopes.setdefault("model", set()).add(handle.handle_id)
+        return handle.handle_id
+
+    if registry_lock is None:
+        return resolve()
+    with registry_lock:
+        return resolve()
+
+
 async def _ensure_mcp_server(server_name: str) -> dict[str, Any]:
     """Ensure one local MCP child is ready, returning a safe health summary."""
 
@@ -520,6 +620,11 @@ def task_view(task: TaskRecord) -> TaskView:
         checkpoint_version=task.checkpoint_version,
         job_snapshot_id=task.job_snapshot_id,
         resume_snapshot_id=task.state.get("resume_snapshot_id"),
+        previous_snapshot_ids=[
+            str(value)
+            for value in task.state.get("previous_snapshot_ids", [])
+            if str(value).strip()
+        ],
         template_id=task.state.get("template_id"),
         output_mode=str(task.state.get("output_mode") or "resume_edit"),
         requested_output_mode=str(
@@ -528,6 +633,7 @@ def task_view(task: TaskRecord) -> TaskView:
         final_product=task.state.get("final_product"),
         selected_candidate_id=task.state.get("selected_candidate") or task.state.get("selected_candidate_id"),
         generation_branch_id=task.state.get("generation_branch_id"),
+        feedback_classification=task.state.get("feedback_classification"),
         embedding_mode=task.state.get("embedding_mode"),
         pending_module=task.state.get("pending_module"),
         project_decision=task.state.get("project_decision"),
@@ -628,10 +734,16 @@ async def environment_recheck(component: str, _: None = Depends(require_internal
                     if browser.get("ok") and isinstance(browser.get("data"), dict):
                         results[name]["browser"] = dict(browser["data"])
                     else:
+                        browser_data = (
+                            browser.get("data")
+                            if isinstance(browser.get("data"), dict)
+                            else {}
+                        )
                         results[name]["browser"] = {
                             "status": "needs_setup",
                             "error_code": browser.get("error_code") or "edge_environment_failed",
                             "requires_user": bool(browser.get("requires_user")),
+                            "message": browser_data.get("message"),
                         }
                 state().mcp_startup_errors.pop(name, None)
             except MCPClientError as exc:
@@ -654,6 +766,22 @@ async def get_settings_api(_: None = Depends(require_internal_token)) -> dict[st
         live = {handle for handle in handles if state().credentials.has(handle)}
         state().credential_scopes[group] = live
         configured[group] = bool(live)
+    registry = getattr(state(), "model_credential_handles", {})
+    lock = getattr(state(), "credential_registry_lock", None)
+    if isinstance(registry, dict):
+        def prune_registry() -> None:
+            for profile_id, handle_id in list(registry.items()):
+                if not state().credentials.has(
+                    handle_id,
+                    scope=f"model:{profile_id}",
+                ):
+                    registry.pop(profile_id, None)
+
+        if lock is None:
+            prune_registry()
+        else:
+            with lock:
+                prune_registry()
     values["configured_in_session"] = configured
     return values
 
@@ -720,6 +848,12 @@ async def create_model_profile(payload: dict[str, Any], _: None = Depends(requir
     except Exception as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     if profile.provider is Provider.OPENAI_COMPATIBLE:
+        from app.core.model_gateway import canonicalize_openai_base_url
+
+        try:
+            profile.base_url = canonicalize_openai_base_url(profile.base_url)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         profile.credential_required = True
     if state().store.get_profile(profile.profile_id) is not None:
         raise HTTPException(
@@ -785,10 +919,14 @@ async def probe_model(profile_id: str, payload: dict[str, Any] | None = Body(def
         from app.core.model_gateway import CredentialUnavailable, ModelGateway
 
         gateway = ModelGateway(credential_store=state().credentials)
+        credential_handle_id = _materialize_model_credential(
+            profile.profile_id,
+            str((payload or {}).get("credential_handle_id") or "") or None,
+        )
         result = await asyncio.to_thread(
             gateway.probe,
             _gateway_profile(profile),
-            credential_handle_id=(payload or {}).get("credential_handle_id"),
+            credential_handle_id=credential_handle_id,
         )
         result = _probe_response(result)
     except CredentialUnavailable as exc:
@@ -841,20 +979,119 @@ async def probe_model(profile_id: str, payload: dict[str, Any] | None = Body(def
 @app.post("/api/credentials/session")
 async def create_credential_session(payload: dict[str, Any], _: None = Depends(require_internal_token)) -> dict[str, Any]:
     secret = payload.get("api_key") or payload.get("github_token")
+    profile_id = str(payload.get("profile_id") or "").strip()
     scope_value = payload.get("scope")
-    if not scope_value and payload.get("profile_id"):
-        scope_value = f"model:{payload['profile_id']}"
+    if not scope_value and profile_id:
+        scope_value = f"model:{profile_id}"
     scope = str(scope_value or "")
+    if profile_id and scope != f"model:{profile_id}":
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error_code": "credential_scope_mismatch",
+                "message": "模型凭据 scope 与 profile_id 不匹配",
+            },
+        )
+    if not secret and profile_id:
+        try:
+            secret = state().secret_store.get(profile_id)
+        except SecretStoreUnavailable as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"error_code": "credential_store_unavailable", "message": str(exc)},
+            ) from exc
     if not secret or not scope:
         raise HTTPException(status_code=422, detail="secret and scope are required")
     try:
+        if profile_id and bool(payload.get("persist", True)):
+            state().secret_store.set(profile_id, str(secret))
         ttl_seconds = int(payload.get("ttl_seconds", 300))
         handle = state().credentials.put(str(secret), scope=scope, ttl_seconds=ttl_seconds)
+    except SecretStoreUnavailable as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"error_code": "credential_store_unavailable", "message": str(exc)},
+        ) from exc
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     scope_group = "github" if "github" in scope.lower() else "model"
     state().credential_scopes.setdefault(scope_group, set()).add(handle.handle_id)
+    if profile_id:
+        registry = getattr(state(), "model_credential_handles", None)
+        lock = getattr(state(), "credential_registry_lock", None)
+
+        def register_handle() -> None:
+            if not isinstance(registry, dict):
+                return
+            previous = registry.get(profile_id)
+            registry[profile_id] = handle.handle_id
+            if previous and previous != handle.handle_id:
+                state().credentials.revoke(previous)
+                state().credential_scopes.setdefault("model", set()).discard(previous)
+
+        if lock is None:
+            register_handle()
+        else:
+            with lock:
+                register_handle()
     return {"credential_handle_id": handle.handle_id, "scope": handle.scope, "expires_at": handle.expires_at_iso}
+
+
+@app.get("/api/credentials/stored/{profile_id}")
+async def stored_credential_status(
+    profile_id: str,
+    _: None = Depends(require_internal_token),
+) -> dict[str, Any]:
+    try:
+        stored = state().secret_store.has(profile_id)
+        if not stored:
+            return {"stored": False, "usable": False, "available": True}
+        secret = state().secret_store.get(profile_id)
+    except SecretStoreUnavailable as exc:
+        return {
+            "stored": False,
+            "usable": False,
+            "available": True,
+            "needs_reentry": True,
+            "message": str(exc),
+        }
+    return {
+        "stored": bool(secret),
+        "usable": bool(secret),
+        "available": True,
+        "needs_reentry": False,
+    }
+
+
+@app.delete("/api/credentials/stored/{profile_id}")
+async def delete_stored_credential(
+    profile_id: str,
+    _: None = Depends(require_internal_token),
+) -> dict[str, bool]:
+    try:
+        removed = state().secret_store.delete(profile_id)
+    except SecretStoreUnavailable as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"error_code": "credential_store_unavailable", "message": str(exc)},
+        ) from exc
+    registry = getattr(state(), "model_credential_handles", None)
+    lock = getattr(state(), "credential_registry_lock", None)
+
+    def revoke_active_handle() -> None:
+        if not isinstance(registry, dict):
+            return
+        handle_id = registry.pop(profile_id, None)
+        if handle_id:
+            state().credentials.revoke(handle_id)
+            state().credential_scopes.setdefault("model", set()).discard(handle_id)
+
+    if lock is None:
+        revoke_active_handle()
+    else:
+        with lock:
+            revoke_active_handle()
+    return {"removed": removed}
 
 
 @app.delete("/api/credentials/session/{handle_id}")
@@ -862,6 +1099,21 @@ async def delete_credential_session(handle_id: str, _: None = Depends(require_in
     revoked = state().credentials.revoke(handle_id)
     for handles in state().credential_scopes.values():
         handles.discard(handle_id)
+    registry = getattr(state(), "model_credential_handles", None)
+    lock = getattr(state(), "credential_registry_lock", None)
+
+    def forget_handle() -> None:
+        if not isinstance(registry, dict):
+            return
+        for profile_id, active_handle in list(registry.items()):
+            if active_handle == handle_id:
+                registry.pop(profile_id, None)
+
+    if lock is None:
+        forget_handle()
+    else:
+        with lock:
+            forget_handle()
     return {"revoked": revoked}
 
 
@@ -872,8 +1124,9 @@ async def set_consent(
 ) -> dict[str, Any]:
     """Record a user decision for an external/risk-gated operation.
 
-    Consent is non-secret audit state and survives restart.  API keys and GitHub
-    tokens still remain process-local and never enter this persistence path.
+    Consent is non-secret audit state and survives restart. Model API keys use
+    the separate machine-local encrypted store; GitHub tokens remain
+    process-local. Neither credential type enters this persistence path.
     """
     aliases = {
         "external-model": "external_model",
@@ -1026,8 +1279,19 @@ async def create_job(request: JobCreateRequest, _: None = Depends(require_intern
     return {"job_id": job_id, "job_snapshot_id": snapshot_id or f"snapshot_{job_id}"}
 
 
-def _persist_discovered_job(job: JobInput) -> tuple[str, str | None, JobInput]:
-    """Upsert a discovered URL without erasing a previously parsed detail."""
+def _persist_discovered_job(
+    job: JobInput,
+    *,
+    authoritative_recruiter: bool = False,
+) -> tuple[str, str | None, JobInput]:
+    """Upsert a discovered URL without mixing recruiter data between sources.
+
+    The BOSS search card renders the HR name and activity together and is the
+    authoritative source for that pair.  Detail panes are asynchronous, so a
+    detail parse must not replace a concrete card value.  Conversely, a fresh
+    card render *must* be allowed to replace a stale value saved by an earlier
+    search because activity naturally changes over time.
+    """
 
     existing_pair = state().store.find_job_by_source_url(job.source_url or "")
     if existing_pair is None:
@@ -1035,6 +1299,30 @@ def _persist_discovered_job(job: JobInput) -> tuple[str, str | None, JobInput]:
         current = job
     else:
         job_id, existing = existing_pair
+        existing_activity = str(existing.hr_activity or "").strip()
+        incoming_activity = str(job.hr_activity or "").strip()
+        existing_name = str(existing.hr_name or "").strip()
+        incoming_name = str(job.hr_name or "").strip()
+        # The list card displays HR name and activity as one authoritative
+        # label. Detail-pane content is asynchronous and can still describe
+        # the previously selected card, so never overwrite a concrete card
+        # value with a later detail reparse.
+        if (
+            authoritative_recruiter
+            and incoming_name
+            and incoming_activity not in {"", "活跃时间待解析"}
+        ):
+            merged_hr_name = job.hr_name
+            merged_activity = job.hr_activity
+        elif existing_name or existing_activity not in {"", "活跃时间待解析"}:
+            # Preserve the previous pair as a unit. Combining a newly parsed
+            # activity with an old name (or vice versa) fabricates a recruiter
+            # state that was never present on one card.
+            merged_hr_name = existing.hr_name
+            merged_activity = existing.hr_activity
+        else:
+            merged_hr_name = job.hr_name
+            merged_activity = job.hr_activity or existing.hr_activity
         current = JobInput(
             title=job.title or existing.title,
             company=job.company or existing.company,
@@ -1043,7 +1331,8 @@ def _persist_discovered_job(job: JobInput) -> tuple[str, str | None, JobInput]:
             responsibilities=job.responsibilities or existing.responsibilities,
             requirements=job.requirements or existing.requirements,
             skills=job.skills or existing.skills,
-            hr_activity=job.hr_activity or existing.hr_activity,
+            hr_name=merged_hr_name,
+            hr_activity=merged_activity,
             posted_at=job.posted_at or existing.posted_at,
             posted_at_label=job.posted_at_label or existing.posted_at_label,
             source_url=job.source_url or existing.source_url,
@@ -1068,6 +1357,8 @@ async def _enhance_job_detail_with_chat_model(
     *,
     chat_profile_id: str | None = None,
     credential_handle_id: str | None = None,
+    feedback: str | None = None,
+    previous_job: JobInput | None = None,
 ) -> tuple[JobInput, dict[str, Any]]:
     """Enhance a rule-parsed JD while preserving a usable fallback on failure."""
 
@@ -1105,6 +1396,10 @@ async def _enhance_job_detail_with_chat_model(
         )
     if profile.provider is Provider.OPENAI_COMPATIBLE:
         credentials = getattr(app_state, "credentials", None)
+        credential_handle_id = _materialize_model_credential(
+            profile.profile_id,
+            credential_handle_id,
+        )
         if (
             credentials is None
             or not credential_handle_id
@@ -1114,7 +1409,7 @@ async def _enhance_job_detail_with_chat_model(
             )
         ):
             return job, rule_fallback_metadata(
-                warning="云端模型 API Key 未暂存或已失效，当前使用规则解析结果",
+                warning="云端模型 API Key 未配置或无法恢复，当前使用规则解析结果",
                 error_code="credential_missing",
                 profile=profile,
             )
@@ -1145,14 +1440,30 @@ async def _enhance_job_detail_with_chat_model(
             profile=profile,
             gateway=gateway,
             credential_handle_id=credential_handle_id,
+            feedback=feedback,
+            previous_job=previous_job,
         )
         return outcome.job, outcome.metadata
     except Exception as exc:
         error_code = str(getattr(exc, "code", "model_parse_failed"))
+        error_message = str(
+            getattr(exc, "message", None) or str(exc) or "模型返回格式不符合要求"
+        ).strip()
+        if isinstance(exc, json.JSONDecodeError):
+            error_message = "模型没有返回完整的 JSON 结构"
+        elif isinstance(exc, TypeError):
+            error_message = str(exc) or "模型返回字段类型不正确"
+        elif isinstance(exc, ValueError):
+            error_message = str(exc) or "模型返回内容未通过 JD 原文校验"
         return job, rule_fallback_metadata(
-            warning="聊天模型解析失败，已安全保留规则解析结果",
+            warning=(
+                f"聊天模型解析失败：{error_message[:180]}；"
+                "已安全保留规则解析结果，可直接再次使用大模型解析"
+            ),
             error_code=error_code,
             profile=profile,
+            retryable=bool(getattr(exc, "retryable", True)),
+            error_message=error_message[:500],
         )
 
 
@@ -1191,6 +1502,9 @@ async def ocr_job_screenshot(
             "ocr_dependency_missing",
             "ocr_model_not_installed",
             "ocr_model_load_failed",
+            "ocr_model_permission_denied",
+            "ocr_memory_exhausted",
+            "ocr_runtime_incompatible",
         } else 422
         raise HTTPException(
             status_code=status_code,
@@ -1221,6 +1535,7 @@ async def ocr_job_screenshot(
         },
         "needs_confirmation": True,
         "job_created": False,
+        "inferred": infer_job_metadata(result["text"]),
     }
 
 
@@ -1240,37 +1555,45 @@ async def confirm_job_screenshot(
     app_state = state()
     _prune_pending_ocr(app_state)
     with app_state.pending_ocr_lock:
-        pending = app_state.pending_ocr.pop(request.ocr_id, None)
+        pending = app_state.pending_ocr.get(request.ocr_id)
     if pending is None:
-        raise HTTPException(
-            status_code=404,
-            detail={
-                "error_code": "ocr_result_not_found",
-                "message": "OCR 结果不存在或已过期，请重新识别截图",
-            },
-        )
-    try:
-        parsed = parse_job_detail_text(
-            request.title.strip(),
-            corrected_text,
-            company=request.company,
-            city=request.city,
-            hr_activity=request.hr_activity,
-        ).model_copy(update={"salary": request.salary})
-        parsed, parser = await _enhance_job_detail_with_chat_model(
-            parsed,
-            chat_profile_id=request.chat_profile_id,
-            credential_handle_id=request.credential_handle_id,
-        )
-        job_id, snapshot_id, parsed = _persist_discovered_job(parsed)
-    except Exception:
-        # A transient persistence failure must not force another expensive OCR
-        # run. Restore the staged text, while still making confirmation
-        # single-consumer under normal operation.
+        # The image intentionally never leaves the Streamlit page session and
+        # OCR staging is in-memory. If FastAPI restarted (or a response was
+        # lost after a successful confirmation), the browser still owns the
+        # user-corrected OCR text. Recover from that text instead of forcing an
+        # expensive image upload/OCR pass again.
+        pending = {
+            "created_at": time.time(),
+            "text": corrected_text,
+            "text_hash": hashlib.sha256(corrected_text.encode("utf-8")).hexdigest(),
+            "model": "client_recovered_ocr_text",
+            "recovered": True,
+        }
         with app_state.pending_ocr_lock:
-            app_state.pending_ocr.setdefault(request.ocr_id, pending)
-        raise
-    return {
+            app_state.pending_ocr[request.ocr_id] = pending
+    cached_response = pending.get("confirmed_response")
+    if isinstance(cached_response, dict):
+        # Confirmation is idempotent. This covers an HTTP timeout after the
+        # server already persisted the job and lets the next click restore the
+        # OCR fallback screen without creating a duplicate job.
+        return {**cached_response, "confirmation_replayed": True}
+    inferred = infer_job_metadata(corrected_text)
+    parsed = parse_job_detail_text(
+        str(request.title or inferred.get("title") or "截图岗位").strip(),
+        corrected_text,
+        company=request.company or inferred.get("company"),
+        city=request.city or inferred.get("city"),
+        hr_name=request.hr_name or inferred.get("hr_name"),
+        hr_activity=request.hr_activity or inferred.get("hr_activity"),
+    ).model_copy(update={"salary": request.salary or inferred.get("salary")})
+    parsed, parser = await _enhance_job_detail_with_chat_model(
+        parsed,
+        chat_profile_id=request.chat_profile_id,
+        credential_handle_id=request.credential_handle_id,
+    )
+    job_id, snapshot_id, parsed = _persist_discovered_job(parsed)
+    app_state.job_parse_confirmations[job_id] = False
+    response = {
         "status": "ready",
         "source": "screenshot_ocr_confirmed",
         "job_id": job_id,
@@ -1281,8 +1604,21 @@ async def confirm_job_screenshot(
             != pending["text_hash"]
         ),
         "parser": parser,
+        "model_fallback": parser.get("parser_mode") != "model_enhanced",
+        "model_fallback_message": (
+            "大模型增强解析失败或不可用，已保留 OCR 校正文字和规则解析结果；"
+            "配置模型后可直接重新解析，无需再次上传截图"
+            if parser.get("parser_mode") != "model_enhanced"
+            else None
+        ),
         "job": {**_job_summary(job_id, parsed), "raw_text": parsed.raw_text},
     }
+    with app_state.pending_ocr_lock:
+        staged = app_state.pending_ocr.get(request.ocr_id)
+        if staged is not None:
+            staged["confirmed_response"] = response
+            staged["confirmed_at"] = time.time()
+    return response
 
 
 def _require_post_time_risk_consent() -> None:
@@ -1321,6 +1657,7 @@ async def job_from_url(request: JobUrlRequest, _: None = Depends(require_interna
             credential_handle_id=request.credential_handle_id,
         )
         job_id, snapshot_id, parsed = _persist_discovered_job(parsed)
+        state().job_parse_confirmations[job_id] = False
         return {
             "status": "ready",
             "source": "provided_text",
@@ -1375,6 +1712,7 @@ async def job_from_url(request: JobUrlRequest, _: None = Depends(require_interna
         credential_handle_id=request.credential_handle_id,
     )
     job_id, snapshot_id, parsed = _persist_discovered_job(parsed)
+    state().job_parse_confirmations[job_id] = False
     return {
         "status": "ready",
         "source": "boss_mcp",
@@ -1396,6 +1734,7 @@ def _job_summary(job_id: str, job: JobInput, created_at: float | None = None, up
         "responsibilities": job.responsibilities,
         "requirements": job.requirements,
         "skills": job.skills,
+        "hr_name": job.hr_name,
         "hr_activity": job.hr_activity or "活跃时间待解析",
         "posted_at": job.posted_at.isoformat() if job.posted_at else None,
         "posted_at_label": job.posted_at_label or ("发布时间未知" if not job.posted_at else None),
@@ -1484,6 +1823,7 @@ async def search_jobs(
     remote_next_cursor: str | None = None
     remote_load_pending = False
     remote_exhausted = False
+    remote_collection: dict[str, Any] = {}
     remote_error_code: str | None = None
     remote_message: str | None = None
     health = await _ensure_mcp_server("boss")
@@ -1501,7 +1841,7 @@ async def search_jobs(
             remote = await state().mcp_manager.call_tool("boss", "boss_search_jobs", arguments)
         except MCPClientError as exc:
             remote_error_code = exc.error_code
-            remote_message = "BOSS MCP 调用失败，已回退到本地职位历史"
+            remote_message = "BOSS 实时采集失败，请保持岗位采集 Edge 打开后重试"
         else:
             if remote.get("ok") and isinstance(remote.get("data"), dict):
                 imported_ids = set()
@@ -1509,12 +1849,17 @@ async def search_jobs(
                 remote_next_cursor = str(remote_data.get("next_cursor") or "").strip() or None
                 remote_load_pending = bool(remote_data.get("load_pending"))
                 remote_exhausted = bool(remote_data.get("exhausted"))
+                if isinstance(remote_data.get("collection"), dict):
+                    remote_collection = dict(remote_data["collection"])
                 for item in remote_data.get("items", []):
                     if not isinstance(item, dict):
                         continue
                     try:
                         parsed = _job_from_mcp(item)
-                        job_id, _, _ = _persist_discovered_job(parsed)
+                        job_id, _, _ = _persist_discovered_job(
+                            parsed,
+                            authoritative_recruiter=True,
+                        )
                     except (TypeError, ValueError):
                         continue
                     imported_ids.add(job_id)
@@ -1524,7 +1869,28 @@ async def search_jobs(
                 remote_message = data.get("message") or "请在可见 Edge 中完成登录或验证后重试"
     else:
         remote_error_code = str(health.get("error_code") or "mcp_unavailable")
-        remote_message = "BOSS MCP 暂不可用，已回退到本地职位历史"
+        remote_message = "BOSS MCP 暂不可用，请重新检测后重试"
+
+    # Login, verification and retained-session errors are not cache-fallback
+    # conditions. Returning historical jobs here made an explicitly logged-out
+    # page look like a successful fresh search and allowed stale cards to be
+    # selected. Keep the result empty until the user completes the visible
+    # browser action and manually submits the same search again.
+    if imported_ids is None and remote_error_code:
+        return {
+            "status": "waiting_user",
+            "source": "boss_mcp",
+            "jobs": [],
+            "total": 0,
+            "next_cursor": None,
+            "has_more": False,
+            "load_pending": False,
+            "exhausted": False,
+            "collection": {"status": "waiting_user", "batch_size": 0},
+            "error_code": remote_error_code,
+            "requires_user": True,
+            "message": remote_message,
+        }
 
     now = datetime.now(timezone.utc)
     matches: list[tuple[int, dict[str, Any]]] = []
@@ -1598,6 +1964,14 @@ async def search_jobs(
         "has_more": next_cursor is not None,
         "load_pending": remote_load_pending,
         "exhausted": remote_exhausted,
+        "collection": remote_collection or {
+            "status": (
+                "complete"
+                if remote_exhausted
+                else ("waiting_for_more" if remote_load_pending else "batch_ready")
+            ),
+            "batch_size": len(page),
+        },
         "error_code": remote_error_code,
         "requires_user": remote_error_code is not None,
         "message": remote_message,
@@ -1658,7 +2032,10 @@ async def open_job_in_collection_browser(
     except MCPClientError as exc:
         raise HTTPException(
             status_code=503,
-            detail={"error_code": exc.error_code, "message": "打开岗位页面失败"},
+            detail={
+                "error_code": exc.error_code,
+                "message": "岗位采集 Edge 暂时不可用，请保持搜索窗口打开后重试",
+            },
         ) from exc
     if not result.get("ok"):
         data = result.get("data") if isinstance(result.get("data"), dict) else {}
@@ -1690,11 +2067,116 @@ async def jobs_history(
     }
 
 
+def _edited_job_list(
+    body: dict[str, Any],
+    key: str,
+    current: list[str],
+    *,
+    max_item_length: int,
+) -> list[str]:
+    """Validate one user-edited JD array without silently coercing objects."""
+
+    if key not in body:
+        return list(current)
+    value = body.get(key)
+    if not isinstance(value, list):
+        raise HTTPException(
+            status_code=422,
+            detail={"error_code": "invalid_job_correction", "message": f"{key} 必须是字符串数组"},
+        )
+    if len(value) > 100:
+        raise HTTPException(
+            status_code=422,
+            detail={"error_code": "invalid_job_correction", "message": f"{key} 最多包含 100 项"},
+        )
+    result: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            raise HTTPException(
+                status_code=422,
+                detail={"error_code": "invalid_job_correction", "message": f"{key} 只能包含字符串"},
+            )
+        text = item.strip()
+        if not text:
+            continue
+        if len(text) > max_item_length:
+            raise HTTPException(
+                status_code=422,
+                detail={"error_code": "invalid_job_correction", "message": f"{key} 存在过长条目"},
+            )
+        if text not in result:
+            result.append(text)
+    return result
+
+
+def _apply_job_corrections(existing: JobInput, body: dict[str, Any]) -> JobInput:
+    """Apply explicit human corrections while preserving unrelated fields."""
+
+    raw_value = body.get("raw_text", existing.raw_text or "")
+    if not isinstance(raw_value, str):
+        raise HTTPException(
+            status_code=422,
+            detail={"error_code": "invalid_raw_text", "message": "raw_text 必须是字符串"},
+        )
+    raw_text = raw_value.strip()
+    if not raw_text:
+        raise HTTPException(
+            status_code=422,
+            detail={"error_code": "job_text_unavailable", "message": "完整 JD 原文不能为空"},
+        )
+    if len(raw_text) > 200_000:
+        raise HTTPException(
+            status_code=422,
+            detail={"error_code": "job_text_too_large", "message": "完整 JD 原文不能超过 20 万字符"},
+        )
+    responsibilities = _edited_job_list(
+        body,
+        "edited_responsibilities",
+        existing.responsibilities,
+        max_item_length=1000,
+    )
+    requirements = _edited_job_list(
+        body,
+        "edited_requirements",
+        existing.requirements,
+        max_item_length=1000,
+    )
+    skills = _edited_job_list(
+        body,
+        "edited_skills",
+        existing.skills,
+        max_item_length=100,
+    )
+    return existing.model_copy(
+        update={
+            "raw_text": raw_text,
+            "responsibilities": responsibilities,
+            "requirements": requirements,
+            "skills": skills,
+        }
+    )
+
+
+def _updated_job_payload(job_id: str, job: JobInput) -> dict[str, Any]:
+    metadata = next(
+        (item for item in state().store.list_jobs() if item[0] == job_id), None
+    )
+    return {
+        **(
+            _job_summary(job_id, job, metadata[2], metadata[3])
+            if metadata
+            else _job_summary(job_id, job)
+        ),
+        "raw_text": job.raw_text,
+    }
+
+
 async def _reparse_job(job_id: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
     existing = state().store.get_job(job_id)
     if existing is None:
         raise HTTPException(status_code=404, detail={"error_code": "job_not_found", "message": "职位不存在"})
     body = payload or {}
+    feedback = str(body.get("feedback") or "").strip()
     raw_text = body.get("raw_text")
     if raw_text is not None and not isinstance(raw_text, str):
         raise HTTPException(status_code=422, detail={"error_code": "invalid_raw_text", "message": "raw_text 必须是字符串"})
@@ -1751,6 +2233,7 @@ async def _reparse_job(job_id: str, payload: dict[str, Any] | None = None) -> di
     else:
         parsed = job_from_text(existing.title, raw_text, company=existing.company, city=existing.city)
         parsed.salary = existing.salary
+        parsed.hr_name = existing.hr_name
         parsed.hr_activity = existing.hr_activity
         parsed.source_url = existing.source_url
         parsed.posted_at = existing.posted_at
@@ -1758,26 +2241,68 @@ async def _reparse_job(job_id: str, payload: dict[str, Any] | None = None) -> di
         if body.get("posted_at_label") is not None:
             from app.services.job_parser import parse_posted_time
 
-            parsed.posted_at, status = parse_posted_time(str(body.get("posted_at_label")))
-            parsed.posted_at_label = str(body.get("posted_at_label")) if status == "unknown" else str(body.get("posted_at_label"))
+            parsed.posted_at, _ = parse_posted_time(str(body.get("posted_at_label")))
+            parsed.posted_at_label = str(body.get("posted_at_label"))
+    edited_keys = {
+        "edited_responsibilities",
+        "edited_requirements",
+        "edited_skills",
+    }
+    has_structured_edits = bool(edited_keys.intersection(body))
+    if has_structured_edits:
+        parsed = _apply_job_corrections(parsed, body)
     parsed, parser = await _enhance_job_detail_with_chat_model(
         parsed,
         chat_profile_id=(str(body.get("chat_profile_id") or "").strip() or None),
         credential_handle_id=(
             str(body.get("credential_handle_id") or "").strip() or None
         ),
+        feedback=feedback,
+        previous_job=parsed if has_structured_edits else existing,
     )
     updated = state().store.update_job(job_id, parsed)
+    state().job_parse_confirmations[job_id] = False
     if state().db_mirror:
         state().db_mirror.persist_job(job_id, updated)
-    metadata = next((item for item in state().store.list_jobs() if item[0] == job_id), None)
     return {
         "status": "ready",
         "job_id": job_id,
-        "job": _job_summary(job_id, updated, metadata[2], metadata[3]) if metadata else _job_summary(job_id, updated),
+        "job": _updated_job_payload(job_id, updated),
         "parser_version": parser.get("parser_version", "job-parser-v1"),
         "parser": parser,
         "message": "职位文本已重新解析；已创建任务的 job_snapshot 不会被覆盖",
+    }
+
+
+@app.post("/api/jobs/{job_id}/corrections")
+async def save_job_corrections(
+    job_id: str,
+    payload: dict[str, Any] | None = Body(default=None),
+    _: None = Depends(require_internal_token),
+) -> dict[str, Any]:
+    """Persist an explicit human JD correction without invoking a model."""
+
+    existing = state().store.get_job(job_id)
+    if existing is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"error_code": "job_not_found", "message": "职位不存在"},
+        )
+    corrected = _apply_job_corrections(existing, payload or {})
+    updated = state().store.update_job(job_id, corrected)
+    state().job_parse_confirmations[job_id] = False
+    if state().db_mirror:
+        state().db_mirror.persist_job(job_id, updated)
+    return {
+        "status": "ready",
+        "job_id": job_id,
+        "job": _updated_job_payload(job_id, updated),
+        "parser": {
+            "parser_mode": "human_corrected",
+            "parser_version": "human-correction-v1",
+            "warnings": [],
+        },
+        "message": "人工校正已保存，请再次确认解析结果",
     }
 
 
@@ -1788,6 +2313,20 @@ async def reparse_job(
     _: None = Depends(require_internal_token),
 ) -> dict[str, Any]:
     return await _reparse_job(job_id, payload)
+
+
+@app.post("/api/jobs/{job_id}/confirm-parse")
+async def confirm_job_parse(
+    job_id: str,
+    _: None = Depends(require_internal_token),
+) -> dict[str, Any]:
+    if state().store.get_job(job_id) is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"error_code": "job_not_found", "message": "职位不存在"},
+        )
+    state().job_parse_confirmations[job_id] = True
+    return {"status": "confirmed", "job_id": job_id}
 
 
 @app.post("/api/jobs/{job_id}/refresh")
@@ -1827,6 +2366,135 @@ async def upload_resume(file: UploadFile = File(...), _: None = Depends(require_
     if state().db_mirror:
         state().db_mirror.persist_resume(resume, path=str(source_path), data=data)
     return resume.model_dump(mode="json")
+
+
+@app.get("/api/resumes/{resume_id}/source")
+async def get_resume_source(
+    resume_id: str,
+    _: None = Depends(require_internal_token),
+) -> FileResponse:
+    """Return the exact uploaded file for a private in-app preview."""
+
+    resume = state().store.get_resume(resume_id)
+    if resume is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"error_code": "resume_not_found", "message": "简历不存在"},
+        )
+    source_root = (state().settings.data_root / "resumes" / resume_id).resolve()
+    candidate = (source_root / Path(resume.filename).name).resolve()
+    if candidate.parent != source_root or not candidate.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail={"error_code": "resume_source_missing", "message": "原始简历文件不存在"},
+        )
+    media_types = {
+        ".pdf": "application/pdf",
+        ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ".md": "text/markdown; charset=utf-8",
+        ".markdown": "text/markdown; charset=utf-8",
+        ".txt": "text/plain; charset=utf-8",
+    }
+    return FileResponse(
+        candidate,
+        media_type=media_types.get(candidate.suffix.casefold(), "application/octet-stream"),
+        filename=candidate.name,
+        content_disposition_type="inline",
+    )
+
+
+@app.post("/api/resumes/{resume_id}/model-parse")
+async def model_parse_resume(
+    resume_id: str,
+    payload: dict[str, Any] | None = Body(default=None),
+    _: None = Depends(require_internal_token),
+) -> dict[str, Any]:
+    """Structure extracted resume text with a selected ready chat model.
+
+    The rule parse remains available in every failure response, so changing a
+    model or credential never requires uploading the private resume again.
+    """
+
+    resume = state().store.get_resume(resume_id)
+    if resume is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"error_code": "resume_not_found", "message": "简历不存在"},
+        )
+    body = payload or {}
+    profile_id = str(body.get("chat_profile_id") or "").strip()
+    profile = state().store.get_profile(profile_id) if profile_id else next(
+        (
+            item
+            for item in state().store.list_profiles(ModelRole.CHAT.value)
+            if item.default_for_role and item.status == "ready"
+        ),
+        None,
+    )
+
+    def fallback(message: str, error_code: str) -> dict[str, Any]:
+        return {
+            "status": "fallback",
+            "resume": resume.model_dump(mode="json"),
+            "parser": resume_rule_fallback_metadata(
+                warning=message,
+                error_code=error_code,
+                profile=profile,
+            ),
+            "retryable": True,
+        }
+
+    if profile is None:
+        return fallback("未选择已检测成功的聊天模型，已保留规则拆解结果", "chat_profile_not_found")
+    if profile.role is not ModelRole.CHAT:
+        return fallback("所选配置不是聊天模型，已保留规则拆解结果", "invalid_chat_profile_role")
+    if profile.status != "ready":
+        return fallback("所选聊天模型尚未检测成功，已保留规则拆解结果", "model_not_ready")
+
+    handle_id = str(body.get("credential_handle_id") or "").strip() or None
+    if profile.provider is Provider.OPENAI_COMPATIBLE:
+        handle_id = _materialize_model_credential(profile.profile_id, handle_id)
+        if not handle_id or not state().credentials.has(
+            handle_id, scope=f"model:{profile.profile_id}"
+        ):
+            return fallback("云端模型 API Key 无法恢复，已保留规则拆解结果", "credential_missing")
+        if (
+            state().settings.external_model_consent_required
+            and not state().consents.get("external_model:global", {}).get("granted", False)
+        ):
+            return fallback(
+                "尚未确认向外部模型发送简历文字，已保留规则拆解结果",
+                "needs_external_model_consent",
+            )
+    try:
+        outcome = await asyncio.to_thread(
+            structure_resume_with_model,
+            resume,
+            profile=profile,
+            gateway=state().model_gateway,
+            credential_handle_id=handle_id,
+        )
+    except Exception as exc:
+        from app.core.utils import redact_sensitive
+
+        reason = str(redact_sensitive(str(exc) or type(exc).__name__)).strip()
+        if len(reason) > 240:
+            reason = f"{reason[:237]}..."
+        return fallback(
+            "聊天模型拆解简历失败，已安全保留规则拆解结果"
+            + (f"。原因：{reason}" if reason else ""),
+            str(getattr(exc, "code", "resume_model_parse_failed")),
+        )
+    if state().db_mirror and state().db_mirror.available:
+        if not state().db_mirror.persist_resume_sections(outcome.resume):
+            return fallback("模型拆解完成，但数据库暂时无法保存，已保留原结果", "resume_persistence_unavailable")
+    updated = state().store.update_resume(resume_id, outcome.resume)
+    return {
+        "status": "ready",
+        "resume": updated.model_dump(mode="json"),
+        "parser": outcome.metadata,
+        "retryable": False,
+    }
 
 
 def _resume_summary(resume: Any, created_at: float | None = None) -> dict[str, Any]:
@@ -1901,6 +2569,18 @@ async def patch_resume_sections(
         raise HTTPException(status_code=422, detail={"error_code": "sections_required", "message": "sections 不能为空"})
     sections = [item.model_copy(deep=True) for item in resume.sections]
     by_id = {section.section_id: section for section in sections}
+    allowed_modules = {
+        "basic",
+        "summary",
+        "education",
+        "work",
+        "projects",
+        "skills",
+        "evaluation",
+        "certificates",
+        "objective",
+        "other",
+    }
     changed: list[str] = []
     for item in updates:
         if not isinstance(item, dict):
@@ -1924,6 +2604,17 @@ async def patch_resume_sections(
             section.confirmed = bool(item["confirmed"])
         if "title" in item:
             section.title = str(item["title"]) if item["title"] is not None else None
+        if "module" in item:
+            module = str(item["module"] or "").strip()
+            if module not in allowed_modules:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "error_code": "invalid_resume_module",
+                        "message": f"不支持的简历区块类型：{module}",
+                    },
+                )
+            section.module = module  # type: ignore[assignment]
         if "evidence_ids" in item and isinstance(item["evidence_ids"], list):
             section.evidence_ids = [str(value) for value in item["evidence_ids"]]
         changed.append(section_id)
@@ -1990,6 +2681,14 @@ async def create_task(request: TaskCreateRequest, _: None = Depends(require_inte
         job = store.get_job(request.job_id)
     if job is None:
         raise HTTPException(status_code=422, detail="job or job_id is required")
+    if request.job_id and state().job_parse_confirmations.get(request.job_id) is False:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error_code": "job_parse_confirmation_required",
+                "message": "请先确认岗位职责与 JD 解析结果",
+            },
+        )
     source_job_id = request.job_id
     if source_job_id is None:
         source_job_id = store.save_job(job)
@@ -2002,6 +2701,14 @@ async def create_task(request: TaskCreateRequest, _: None = Depends(require_inte
     resume = store.get_resume(request.resume_id) if request.resume_id else None
     if request.resume_id and resume is None:
         raise HTTPException(status_code=404, detail={"error_code": "resume_not_found", "message": "简历不存在"})
+    if resume is not None and any(not section.confirmed for section in resume.sections):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error_code": "resume_parse_confirmation_required",
+                "message": "请先校正并确认简历的机器解析结果",
+            },
+        )
     if resume is None and request.output_mode != "project_only":
         required_base_facts = {
             "name": "姓名",
@@ -2020,13 +2727,20 @@ async def create_task(request: TaskCreateRequest, _: None = Depends(require_inte
                 },
             )
     template_id: str | None = None
+    template_structure_snapshot: dict[str, Any] | None = None
     if resume is None and request.output_mode != "project_only":
         template_id = str(request.template_id or "builtin-cn-single-page").strip()
         template_metadata: dict[str, Any]
         if template_id == "builtin-cn-single-page":
+            builtin_path = write_preview(
+                _BUILTIN_TEMPLATE,
+                root=state().settings.data_root / "templates" / "cache" / template_id,
+                name="template.md",
+            )
             template_metadata = {
                 "template_id": template_id,
                 "source_url": "internal://builtin-cn-single-page",
+                "cached_path": str(builtin_path),
                 "file_type": "markdown",
                 "language": "zh",
                 "license": "internal",
@@ -2048,6 +2762,26 @@ async def create_task(request: TaskCreateRequest, _: None = Depends(require_inte
                     status_code=409,
                     detail={"error_code": "template_metadata_invalid", "message": "所选模板缓存元数据损坏"},
                 ) from exc
+        if request.output_mode == "template_resume":
+            template_source = _resolve_cached_template_source(template_id)
+            confirmed_structure = load_template_structure(template_id, template_source)
+            if not confirmed_structure or not confirmed_structure.get("confirmed"):
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error_code": "template_structure_confirmation_required",
+                        "message": "请先使用聊天模型解析模板结构，校正并确认后再继续",
+                    },
+                )
+            template_structure_snapshot = {
+                "structure_id": confirmed_structure.get("structure_id"),
+                "structure_version": confirmed_structure.get("structure_version"),
+                "source_sha256": confirmed_structure.get("source_sha256"),
+                "confirmed_structure_hash": confirmed_structure.get(
+                    "confirmed_structure_hash"
+                ),
+                "sections": confirmed_structure.get("sections") or [],
+            }
         if state().db_mirror and hasattr(state().db_mirror, "persist_template"):
             state().db_mirror.persist_template(template_metadata)
     task_id = f"task_{uuid.uuid4().hex}"
@@ -2074,19 +2808,49 @@ async def create_task(request: TaskCreateRequest, _: None = Depends(require_inte
         raise HTTPException(status_code=422, detail={"error_code": "invalid_chat_profile_role", "message": "chat_profile_id 必须引用聊天模型"})
     if embedding_profile is not None and embedding_profile.role is not ModelRole.EMBEDDING:
         raise HTTPException(status_code=422, detail={"error_code": "invalid_embedding_profile_role", "message": "embedding_profile_id 必须引用 embedding 模型"})
+    chat_credential_handle_id = request.credential_handle_id
+    if chat_profile and chat_profile.provider is Provider.OPENAI_COMPATIBLE:
+        chat_credential_handle_id = _materialize_model_credential(
+            chat_profile.profile_id,
+            chat_credential_handle_id,
+        )
+    embedding_credential_handle_id = request.embedding_credential_handle_id
+    if embedding_profile and embedding_profile.provider is Provider.OPENAI_COMPATIBLE:
+        embedding_credential_handle_id = _materialize_model_credential(
+            embedding_profile.profile_id,
+            embedding_credential_handle_id,
+        )
     blocked_reason: str | None = None
     initial_status = TaskStatus.QUEUED
     if state().settings.strict_model_gate and (chat_profile is None or chat_profile.status != "ready"):
         initial_status = TaskStatus.PAUSED
         blocked_reason = "needs_model_recheck"
     if chat_profile and chat_profile.provider is Provider.OPENAI_COMPATIBLE:
-        if not request.credential_handle_id or not state().credentials.has(request.credential_handle_id, scope=f"model:{chat_profile.profile_id}"):
+        if not chat_credential_handle_id or not state().credentials.has(chat_credential_handle_id, scope=f"model:{chat_profile.profile_id}"):
             initial_status = TaskStatus.PAUSED
             blocked_reason = "needs_credentials"
         elif state().settings.external_model_consent_required and not state().consents.get("external_model:global", {}).get("granted", False):
             initial_status = TaskStatus.PAUSED
             blocked_reason = "needs_external_model_consent"
-    embedding_mode = "embedding" if embedding_profile and embedding_profile.status == "ready" else "tfidf_fallback"
+    embedding_ready = bool(embedding_profile and embedding_profile.status == "ready")
+    if embedding_ready and embedding_profile and embedding_profile.provider is Provider.OPENAI_COMPATIBLE:
+        embedding_ready = bool(
+            embedding_credential_handle_id
+            and state().credentials.has(
+                embedding_credential_handle_id,
+                scope=f"model:{embedding_profile.profile_id}",
+            )
+        )
+    embedding_mode = "embedding" if embedding_ready else "tfidf_fallback"
+    if (
+        embedding_mode == "embedding"
+        and embedding_profile
+        and embedding_profile.provider is Provider.OPENAI_COMPATIBLE
+        and state().settings.external_model_consent_required
+        and not state().consents.get("external_model:global", {}).get("granted", False)
+    ):
+        initial_status = TaskStatus.PAUSED
+        blocked_reason = "needs_external_model_consent"
     if embedding_mode == "tfidf_fallback" and not request.allow_embedding_fallback:
         initial_status = TaskStatus.PAUSED
         blocked_reason = "needs_model_recheck"
@@ -2123,10 +2887,14 @@ async def create_task(request: TaskCreateRequest, _: None = Depends(require_inte
         resume=resume,
         job_snapshot_id=snapshot_id,
         state={
+            # Every output mode honours the user's 1-5 draft count.  A
+            # project-only task still skips resume replacement, but may offer
+            # several independently copyable drafts before one is confirmed.
             "candidate_count": request.candidate_count,
             "embedding_mode": embedding_mode,
             "base_facts": request.base_facts,
             "template_id": template_id,
+            "template_structure_snapshot": template_structure_snapshot,
             "output_mode": (
                 "project_only" if request.output_mode == "project_only" else "resume_edit"
             ),
@@ -2137,7 +2905,9 @@ async def create_task(request: TaskCreateRequest, _: None = Depends(require_inte
             "embedding_profile_id": embedding_profile_id,
             "embedding_profile_version": embedding_profile.config_version if embedding_profile else None,
             "embedding_profile_snapshot": embedding_profile.model_dump(mode="json") if embedding_profile else None,
-            "credential_handle_id": request.credential_handle_id,
+            "credential_handle_id": chat_credential_handle_id,
+            "chat_credential_handle_id": chat_credential_handle_id,
+            "embedding_credential_handle_id": embedding_credential_handle_id,
             "dimension_weights": dimension_weights,
             "component_weights": component_weights,
             "scoring_config_version": scoring_config_version,
@@ -2279,8 +3049,12 @@ async def task_feedback(task_id: str, request: FeedbackRequest, _: None = Depend
             raise HTTPException(status_code=409, detail={"error_code": "needs_model_recheck", "message": "新聊天模型尚未通过连接和角色探测"})
         handle_id = request.credential_handle_id
         if profile.provider is Provider.OPENAI_COMPATIBLE:
+            handle_id = _materialize_model_credential(
+                profile.profile_id,
+                handle_id,
+            )
             if not handle_id or not state().credentials.has(handle_id, scope=f"model:{profile.profile_id}"):
-                raise HTTPException(status_code=409, detail={"error_code": "needs_credentials", "message": "切换外部模型需要当前会话的有效 API Key"})
+                raise HTTPException(status_code=409, detail={"error_code": "needs_credentials", "message": "切换外部模型需要已保存或当前输入的有效 API Key"})
             if state().settings.external_model_consent_required and not state().consents.get("external_model:global", {}).get("granted", False):
                 raise HTTPException(status_code=409, detail={"error_code": "needs_external_model_consent", "message": "请先确认外部模型数据发送范围"})
         workflow_payload.update(
@@ -2439,6 +3213,47 @@ async def retry_task_step(
     if task.status in {TaskStatus.DELETED, TaskStatus.CANCELLED}:
         raise HTTPException(status_code=409, detail={"error_code": "task_not_retryable", "message": "已删除或取消的任务不能重试"})
 
+    # A task/checkpoint may contain an expired process-local handle after an
+    # API restart.  Restore fresh handles from the machine-local encrypted
+    # store before evaluating retry gates, so users never need to click
+    # "保存配置" again merely to run the next model step.
+    chat_profile_id = str(task.state.get("chat_profile_id") or "")
+    chat_profile = state().store.get_profile(chat_profile_id) if chat_profile_id else None
+    if chat_profile is not None and chat_profile.provider is Provider.OPENAI_COMPATIBLE:
+        restored = _materialize_model_credential(
+            chat_profile_id,
+            str(
+                body.get("credential_handle_id")
+                or task.state.get("credential_handle_id")
+                or ""
+            )
+            or None,
+        )
+        if restored:
+            body["credential_handle_id"] = restored
+            body["chat_credential_handle_id"] = restored
+    embedding_profile_id = str(task.state.get("embedding_profile_id") or "")
+    embedding_profile = (
+        state().store.get_profile(embedding_profile_id)
+        if embedding_profile_id
+        else None
+    )
+    if (
+        embedding_profile is not None
+        and embedding_profile.provider is Provider.OPENAI_COMPATIBLE
+    ):
+        restored_embedding = _materialize_model_credential(
+            embedding_profile_id,
+            str(
+                body.get("embedding_credential_handle_id")
+                or task.state.get("embedding_credential_handle_id")
+                or ""
+            )
+            or None,
+        )
+        if restored_embedding:
+            body["embedding_credential_handle_id"] = restored_embedding
+
     # A blocked reason is a gate, not merely a display label.  Do not let a
     # stale retry request clear credential/model/consent gates and launch a
     # worker with incomplete prerequisites.
@@ -2446,9 +3261,11 @@ async def retry_task_step(
         blocked = task.blocked_reason or ""
         if blocked == "needs_credentials":
             profile_id = str(task.state.get("chat_profile_id") or "")
-            handle_id = task.state.get("credential_handle_id")
+            handle_id = body.get("credential_handle_id") or task.state.get(
+                "credential_handle_id"
+            )
             if not profile_id or not handle_id or not state().credentials.has(str(handle_id), scope=f"model:{profile_id}"):
-                raise HTTPException(status_code=409, detail={"error_code": "needs_credentials", "message": "请重新配置并检测外部模型凭据后再重试"})
+                raise HTTPException(status_code=409, detail={"error_code": "needs_credentials", "message": "本机未找到该模型已保存的 API Key，请返回环境页重新输入一次"})
         elif blocked == "needs_external_model_consent" and not state().consents.get("external_model:global", {}).get("granted", False):
             raise HTTPException(status_code=409, detail={"error_code": "needs_external_model_consent", "message": "请先确认外部模型数据发送范围"})
         elif blocked == "project_region_required":
@@ -2527,7 +3344,13 @@ def _render_task_preview(task: TaskRecord) -> str:
     if resume is not None:
         sections = list(resume.sections)
         project_patch = task.state.get("project_patch")
-        if isinstance(project_patch, dict) and project_patch.get("operation") == "replace":
+        project_operation = (
+            str(project_patch.get("operation") or "")
+            if isinstance(project_patch, dict)
+            else ""
+        )
+        selected_project = candidates[0] if candidates else None
+        if project_operation == "replace":
             target_id = str(project_patch.get("target_project_id") or "")
             target = next((section for section in sections if section.section_id == target_id), None)
             if target is None:
@@ -2541,7 +3364,73 @@ def _render_task_preview(task: TaskRecord) -> str:
                     status_code=409,
                     detail={"error_code": "patch_hash_conflict", "message": "原项目已发生变化，拒绝应用过期替换补丁"},
                 )
-            sections = [section for section in sections if section.section_id != target_id]
+            if selected_project is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"error_code": "selected_candidate_missing", "message": "已确认的替换项目不存在，请重新选择"},
+                )
+            rendered_project = render_candidate_project(selected_project)
+            rendered_lines = rendered_project.splitlines()
+            project_body = "\n".join(rendered_lines[1:]).strip() if rendered_lines else rendered_project
+            project_title = "  ".join(
+                value
+                for value in (selected_project.title.strip(), selected_project.period.strip())
+                if value
+            )
+            replacement = target.model_copy(
+                update={
+                    "title": project_title or selected_project.title,
+                    "content": project_body,
+                    "value_hash": sha256_text(project_body),
+                    "confirmed": True,
+                }
+            )
+            sections = [replacement if section.section_id == target_id else section for section in sections]
+            # The selected project now occupies the exact location of the
+            # replaced section; do not append a duplicate candidate later.
+            candidates = []
+        elif project_operation == "add" and selected_project is not None:
+            rendered_project = render_candidate_project(selected_project)
+            rendered_lines = rendered_project.splitlines()
+            project_body = "\n".join(rendered_lines[1:]).strip() if rendered_lines else rendered_project
+            project_title = "  ".join(
+                value
+                for value in (selected_project.title.strip(), selected_project.period.strip())
+                if value
+            )
+            new_project_section = ResumeSection(
+                section_id=stable_id(
+                    "section", task.task_id, "projects", selected_project.candidate_id
+                ),
+                module="projects",
+                title=project_title or selected_project.title,
+                content=project_body,
+                confirmed=True,
+                value_hash=sha256_text(project_body),
+            )
+            project_indexes = [
+                index
+                for index, section in enumerate(sections)
+                if section.module == "projects"
+                or bool(re.search(r"项目(?:经历|经验)?", str(section.title or "")))
+            ]
+            if project_indexes:
+                insert_at = project_indexes[-1] + 1
+            else:
+                # If a resume has no project block, create one before the
+                # trailing skills/education/certificate/evaluation modules,
+                # never after the entire original document.
+                trailing_modules = {"skills", "education", "certificates", "evaluation"}
+                insert_at = next(
+                    (
+                        index
+                        for index, section in enumerate(sections)
+                        if section.module in trailing_modules
+                    ),
+                    len(sections),
+                )
+            sections.insert(insert_at, new_project_section)
+            candidates = []
         module_patches = task.state.get("module_patches")
         if isinstance(module_patches, dict):
             for module, patch in module_patches.items():
@@ -2590,12 +3479,103 @@ def _render_task_preview(task: TaskRecord) -> str:
         resume = None
     elif output_mode == "original_resume":
         candidates = []
+    template_content: str | None = None
+    template_path = _task_template_path(task)
+    if template_path is not None and template_path.suffix.lower() in {".md", ".markdown"}:
+        try:
+            template_content = template_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error_code": "template_content_invalid",
+                    "message": "所选 Markdown 模板无法读取，请重新下载或选择其他模板",
+                },
+            ) from exc
     return render_markdown(
         job_title=task.job.title if task.job else "",
         candidates=candidates,
         resume=resume,
         selected_candidate_id=(candidates[0].candidate_id if candidates else None),
+        base_facts=(
+            dict(task.state.get("base_facts") or {})
+            if isinstance(task.state.get("base_facts"), dict)
+            else {}
+        ),
+        template_content=template_content,
     )
+
+
+def _task_template_path(task: TaskRecord) -> Path | None:
+    """Resolve only the template file already pinned to this task."""
+
+    template_id = str(task.state.get("template_id") or "").strip()
+    if not template_id:
+        return None
+    cache_root = (state().settings.data_root / "templates" / "cache").resolve()
+    template_root = (cache_root / template_id).resolve()
+    if template_root.parent != cache_root:
+        raise HTTPException(
+            status_code=409,
+            detail={"error_code": "template_path_invalid", "message": "所选模板路径不合法"},
+        )
+    candidates: list[Path] = []
+    metadata_path = template_root / "metadata.json"
+    if metadata_path.is_file():
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"error_code": "template_metadata_invalid", "message": "所选模板缓存元数据损坏"},
+            ) from exc
+        cached_path = Path(str(metadata.get("cached_path") or ""))
+        if str(cached_path):
+            candidates.append(cached_path)
+    if template_root.is_dir():
+        candidates.extend(
+            item
+            for item in sorted(template_root.iterdir())
+            if item.is_file() and item.suffix.lower() in {".md", ".markdown", ".docx"}
+        )
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if (
+            resolved.is_file()
+            and resolved.suffix.lower() in {".md", ".markdown", ".docx"}
+            and template_root in resolved.parents
+        ):
+            return resolved
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "error_code": "template_not_cached",
+            "message": "所选模板缓存不存在，请返回模板选择步骤重新下载",
+        },
+    )
+
+
+def _task_template_replacements(task: TaskRecord) -> dict[str, str]:
+    facts = task.state.get("base_facts")
+    facts = dict(facts) if isinstance(facts, dict) else {}
+    objective = str(facts.get("objective") or (task.job.title if task.job else ""))
+    values = {
+        "name": facts.get("name"),
+        "姓名": facts.get("name"),
+        "phone": facts.get("phone"),
+        "电话": facts.get("phone"),
+        "email": facts.get("email"),
+        "邮箱": facts.get("email"),
+        "location": facts.get("location"),
+        "所在地": facts.get("location"),
+        "objective": objective,
+        "求职目标": objective,
+        "education": facts.get("education"),
+        "教育经历": facts.get("education"),
+        "certificates": facts.get("certificates"),
+        "证书": facts.get("certificates"),
+    }
+    return {key: str(value) for key, value in values.items() if str(value or "").strip()}
 
 
 def _task_bound_to_snapshot(
@@ -2668,7 +3648,136 @@ def _compressed_layout(layout: dict[str, Any], compression: Any) -> dict[str, An
         "font_size_pt": font_size * compression.font_scale,
         "line_spacing": line_spacing * compression.line_spacing,
         "margin_cm": margin_cm * compression.margin_scale,
+        "paragraph_spacing_before_pt": 0,
+        "paragraph_spacing_after_pt": 0,
+        "compact_reflow": bool(getattr(compression, "compact_reflow", False)),
     }
+
+
+_TASK_ARTIFACT_SCOPES = {"previews", "exports"}
+_TASK_ARTIFACT_MEDIA_TYPES = {
+    ".md": "text/markdown; charset=utf-8",
+    ".txt": "text/plain; charset=utf-8",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".pdf": "application/pdf",
+}
+
+
+def _task_artifact_root(task_id: str, scope: str) -> Path:
+    """Return a task-local artifact directory and reject path traversal."""
+
+    if scope not in _TASK_ARTIFACT_SCOPES:
+        raise HTTPException(
+            status_code=404,
+            detail={"error_code": "artifact_scope_invalid", "message": "文件类型不存在"},
+        )
+    tasks_root = (state().settings.data_root / "tasks").resolve()
+    task_root = (tasks_root / str(task_id)).resolve()
+    if task_root.parent != tasks_root:
+        raise HTTPException(
+            status_code=422,
+            detail={"error_code": "artifact_path_invalid", "message": "任务文件路径不合法"},
+        )
+    return (task_root / scope).resolve()
+
+
+def _task_artifact_descriptor(
+    task_id: str,
+    path: str | Path | None,
+    *,
+    scope: str,
+) -> dict[str, Any] | None:
+    """Expose a task file by opaque API URL, never by trusting its raw path."""
+
+    if not path:
+        return None
+    artifact_root = _task_artifact_root(task_id, scope)
+    candidate = Path(path).resolve()
+    if not candidate.is_file() or candidate.parent != artifact_root:
+        return None
+    media_type = _TASK_ARTIFACT_MEDIA_TYPES.get(candidate.suffix.casefold())
+    if media_type is None:
+        return None
+    return {
+        "status": "ready",
+        "file_name": candidate.name,
+        "mime_type": media_type,
+        "size_bytes": candidate.stat().st_size,
+        "download_url": f"/api/tasks/{task_id}/artifacts/{scope}/{candidate.name}",
+    }
+
+
+def _resume_pdf_result(docx_path: Path, pdf_path: Path):
+    """Prefer LibreOffice while retaining the existing test seam and Word fallback."""
+
+    result = convert_pdf_with_libreoffice(docx_path, pdf_path)
+    if result.status == "ready":
+        return result
+    fallback = convert_docx_to_pdf(docx_path, pdf_path)
+    return fallback if fallback.status == "ready" else result
+
+
+def _resume_pdf_with_text_fallback(
+    docx_path: Path,
+    pdf_path: Path,
+    *,
+    content: str,
+    layout: dict[str, Any],
+):
+    """Always return a downloadable PDF when text rendering is available."""
+
+    office_result = _resume_pdf_result(docx_path, pdf_path)
+    if office_result.status == "ready":
+        return office_result
+    text_result = export_text_pdf(content, target=pdf_path, layout=layout)
+    if text_result.status != "ready":
+        return office_result
+    warnings = tuple(
+        dict.fromkeys((*office_result.warnings, *text_result.warnings))
+    )
+    return type(text_result)(
+        text_result.format,
+        text_result.status,
+        text_result.path,
+        text_result.page_count,
+        text_result.one_page,
+        warnings,
+    )
+
+
+@app.get("/api/tasks/{task_id}/artifacts/{scope}/{filename}")
+async def download_task_artifact(
+    task_id: str,
+    scope: str,
+    filename: str,
+    _: None = Depends(require_internal_token),
+) -> FileResponse:
+    """Download only a generated file directly inside this task's artifact root."""
+
+    if state().store.get_task(task_id) is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"error_code": "task_not_found", "message": "任务不存在"},
+        )
+    if not filename or Path(filename).name != filename:
+        raise HTTPException(
+            status_code=422,
+            detail={"error_code": "artifact_path_invalid", "message": "文件名不合法"},
+        )
+    artifact_root = _task_artifact_root(task_id, scope)
+    candidate = (artifact_root / filename).resolve()
+    media_type = _TASK_ARTIFACT_MEDIA_TYPES.get(candidate.suffix.casefold())
+    if candidate.parent != artifact_root or media_type is None or not candidate.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail={"error_code": "artifact_not_found", "message": "导出文件不存在或已失效"},
+        )
+    return FileResponse(
+        candidate,
+        media_type=media_type,
+        filename=candidate.name,
+        content_disposition_type="attachment",
+    )
 
 
 @app.post("/api/tasks/{task_id}/export-preview")
@@ -2709,7 +3818,10 @@ async def export_preview(
         raise HTTPException(status_code=409, detail={"error_code": "snapshot_required", "message": "预览必须显式绑定 snapshot_id"})
     if str(requested_snapshot) != snapshot_id:
         raise HTTPException(status_code=409, detail={"error_code": "snapshot_conflict", "message": "预览必须绑定当前不可变简历快照"})
-    content = _render_task_preview(_task_bound_to_snapshot(task, snapshot_id))
+    bound_task = _task_bound_to_snapshot(task, snapshot_id)
+    content = _render_task_preview(bound_task)
+    template_path = _task_template_path(bound_task)
+    template_replacements = _task_template_replacements(bound_task)
     pages = estimate_pages(content)
     preview_root = state().settings.data_root / "tasks" / task_id / "previews"
     layout = body.get("layout") if isinstance(body.get("layout"), dict) else {}
@@ -2718,6 +3830,11 @@ async def export_preview(
     saved_compression = saved_compression if isinstance(saved_compression, dict) else {}
     accept_compression = bool(body.get("accept_compression", saved_compression.get("accepted", False)))
     allow_rewrite = bool(body.get("allow_rewrite", saved_compression.get("allow_rewrite", False)))
+    compression_level = str(
+        body.get("compression_level")
+        or saved_compression.get("level")
+        or "standard"
+    )
     if pages > 1 and not accept_compression and saved_compression.get("compliance_status") != "multi_page_allowed":
         markdown_path = write_preview(content, root=preview_root, name="resume-preview.md")
         return {
@@ -2735,7 +3852,11 @@ async def export_preview(
             "compliance_status": "overflow",
         }
     if pages > 1 and accept_compression:
-        compressed = compress_markdown(content, allow_rewrite=allow_rewrite)
+        compressed = compress_markdown(
+            content,
+            allow_rewrite=allow_rewrite,
+            level=compression_level,
+        )
         content = compressed.content
         pages = compressed.page_count
         compression = {
@@ -2745,6 +3866,8 @@ async def export_preview(
             "rewritten": compressed.rewritten,
             "warnings": list(compressed.warnings),
             "density": compressed.density,
+            "level": compressed.level,
+            "compact_reflow": compressed.compact_reflow,
         }
         # Pass the approved style adjustment to DOCX generation while retaining
         # one consistent body/heading font family.
@@ -2764,18 +3887,77 @@ async def export_preview(
         "page_count_source": "estimate",
         "compliance_status": "draft_preview" if pages <= 1 else "overflow",
     }
+    result["markdown_artifact"] = _task_artifact_descriptor(
+        task_id, markdown_path, scope="previews"
+    )
     if compression is not None:
         result["compression"] = compression
-    if format_name == "docx":
-        docx_result = export_docx(content, target=preview_root / "resume-preview.docx", layout=layout)
+    if format_name in {"md", "text", "txt"}:
+        result["artifact"] = result["markdown_artifact"]
+    elif format_name == "docx":
+        docx_result = export_docx(
+            content,
+            target=preview_root / "resume-preview.docx",
+            layout=layout,
+            template_path=template_path,
+            template_replacements=template_replacements,
+        )
         result["docx"] = docx_result.__dict__
+        result["artifact"] = _task_artifact_descriptor(
+            task_id, docx_result.path, scope="previews"
+        )
+        if docx_result.path:
+            pdf_preview = _resume_pdf_with_text_fallback(
+                Path(docx_result.path),
+                preview_root / "resume-preview.pdf",
+                content=content,
+                layout=layout,
+            )
+            result["visual_preview"] = {
+                **pdf_preview.__dict__,
+                "artifact": _task_artifact_descriptor(
+                    task_id, pdf_preview.path, scope="previews"
+                ),
+            }
+        else:
+            result["visual_preview"] = {
+                "status": "unavailable",
+                "artifact": None,
+                "warnings": list(docx_result.warnings),
+            }
         if docx_result.status != "preview_pending":
             result["status"] = "preview_pending" if docx_result.status in {"dependency_missing", "conversion_failed"} else docx_result.status
             result["error_code"] = "documents_dependency_missing" if docx_result.status == "dependency_missing" else "document_preview_unavailable"
     elif format_name == "pdf":
-        docx = export_docx(content, target=preview_root / "resume-preview.docx", layout=layout)
-        pdf_result = convert_pdf_with_libreoffice(Path(docx.path), preview_root / "resume-preview.pdf") if docx.path else None
+        docx = export_docx(
+            content,
+            target=preview_root / "resume-preview.docx",
+            layout=layout,
+            template_path=template_path,
+            template_replacements=template_replacements,
+        )
+        pdf_result = (
+            _resume_pdf_with_text_fallback(
+                Path(docx.path),
+                preview_root / "resume-preview.pdf",
+                content=content,
+                layout=layout,
+            )
+            if docx.path
+            else export_text_pdf(
+                content,
+                target=preview_root / "resume-preview.pdf",
+                layout=layout,
+            )
+        )
         result["pdf"] = pdf_result.__dict__ if pdf_result else {"status": "dependency_missing", "path": None}
+        result["artifact"] = _task_artifact_descriptor(
+            task_id, pdf_result.path if pdf_result else None, scope="previews"
+        )
+        result["visual_preview"] = {
+            **(pdf_result.__dict__ if pdf_result else {"status": "dependency_missing"}),
+            "artifact": result["artifact"],
+        }
         if pdf_result is not None and pdf_result.status == "ready" and pdf_result.page_count is not None:
             result["page_count"] = pdf_result.page_count
             result["page_count_source"] = "rendered_pdf"
@@ -2812,14 +3994,32 @@ async def export_task(
         raise HTTPException(status_code=409, detail={"error_code": "snapshot_conflict", "message": "导出必须绑定当前不可变简历快照"})
     if not snapshot_id:
         raise HTTPException(status_code=409, detail={"error_code": "snapshot_required", "message": "请先创建不可变简历快照"})
-    content = _render_task_preview(
-        _task_bound_to_snapshot(task, str(snapshot_id), require_confirmed=True)
+    bound_task = _task_bound_to_snapshot(
+        task, str(snapshot_id), require_confirmed=True
     )
+    content = _render_task_preview(bound_task)
+    template_path = _task_template_path(bound_task)
+    template_replacements = _task_template_replacements(bound_task)
     original_pages = estimate_pages(content)
     layout = body.get("layout") if isinstance(body.get("layout"), dict) else {}
     compression: dict[str, Any] | None = None
-    if original_pages > 1 and bool(body.get("accept_compression", False)):
-        compressed = compress_markdown(content, allow_rewrite=bool(body.get("allow_rewrite", False)))
+    saved_compression = task.state.get("compression_decision")
+    saved_compression = saved_compression if isinstance(saved_compression, dict) else {}
+    accept_compression = bool(
+        body.get("accept_compression", saved_compression.get("accepted", False))
+    )
+    if original_pages > 1 and accept_compression:
+        compressed = compress_markdown(
+            content,
+            allow_rewrite=bool(
+                body.get("allow_rewrite", saved_compression.get("allow_rewrite", False))
+            ),
+            level=str(
+                body.get("compression_level")
+                or saved_compression.get("level")
+                or "standard"
+            ),
+        )
         content = compressed.content
         layout = _compressed_layout(layout, compressed)
         compression = {
@@ -2829,6 +4029,8 @@ async def export_task(
             "rewritten": compressed.rewritten,
             "warnings": list(compressed.warnings),
             "density": compressed.density,
+            "level": compressed.level,
+            "compact_reflow": compressed.compact_reflow,
         }
     final_pages = estimate_pages(content, density=(compressed.density if compression is not None else 1.0))
     root = state().settings.data_root / "tasks" / task_id / "exports"
@@ -2836,46 +4038,75 @@ async def export_task(
     format_name = str(body.get("format") or "markdown").lower()
     if format_name in {"markdown", "md", "text", "txt"}:
         path = write_preview(content, root=root, name="resume.md")
-        result = {"status": "ready", "format": "markdown", "output_path": str(path), "content": content, "page_count": final_pages, "estimated_page_count": final_pages, "page_count_source": "estimate", "snapshot_id": snapshot_id, "compliance_status": "one_page" if final_pages <= 1 else "overflow"}
+        result = {"status": "ready", "format": "markdown", "task_id": task_id, "checkpoint_version": task.checkpoint_version, "output_path": str(path), "content": content, "page_count": final_pages, "estimated_page_count": final_pages, "page_count_source": "estimate", "snapshot_id": snapshot_id, "compliance_status": "one_page" if final_pages <= 1 else "overflow", "artifact": _task_artifact_descriptor(task_id, path, scope="exports")}
         if compression is not None:
             result["compression"] = compression
         return result
     if format_name == "docx":
-        docx_result = export_docx(content, target=root / "resume.docx", layout=layout)
+        docx_result = export_docx(
+            content,
+            target=root / "resume.docx",
+            layout=layout,
+            template_path=template_path,
+            template_replacements=template_replacements,
+        )
         result = {
             "status": docx_result.status,
             "format": "docx",
+            "task_id": task_id,
+            "checkpoint_version": task.checkpoint_version,
             "snapshot_id": snapshot_id,
             **docx_result.__dict__,
             "content": content,
             "estimated_page_count": final_pages,
             "page_count_source": "unverified",
             "compliance_status": "preview_pending",
+            "artifact": _task_artifact_descriptor(
+                task_id, docx_result.path, scope="exports"
+            ),
         }
+        if docx_result.path:
+            pdf_preview = _resume_pdf_with_text_fallback(
+                Path(docx_result.path),
+                root / "resume-preview.pdf",
+                content=content,
+                layout=layout,
+            )
+            result["visual_preview"] = {
+                **pdf_preview.__dict__,
+                "artifact": _task_artifact_descriptor(
+                    task_id, pdf_preview.path, scope="exports"
+                ),
+            }
         if compression is not None:
             result["compression"] = compression
         if docx_result.status == "dependency_missing":
             result["error_code"] = "documents_dependency_missing"
         return result
     if format_name == "pdf":
-        docx = export_docx(content, target=root / "resume.docx", layout=layout)
-        if not docx.path:
-            return {
-                "status": "blocked",
-                "format": "pdf",
-                "snapshot_id": snapshot_id,
-                "error_code": "documents_dependency_missing",
-                "content": content,
-                "page_count": None,
-                "estimated_page_count": final_pages,
-                "page_count_source": "unverified",
-                "compliance_status": "preview_pending",
-            }
-        pdf_result = convert_pdf_with_libreoffice(Path(docx.path), root / "resume.pdf")
+        docx = export_docx(
+            content,
+            target=root / "resume.docx",
+            layout=layout,
+            template_path=template_path,
+            template_replacements=template_replacements,
+        )
+        pdf_result = (
+            _resume_pdf_with_text_fallback(
+                Path(docx.path),
+                root / "resume.pdf",
+                content=content,
+                layout=layout,
+            )
+            if docx.path
+            else export_text_pdf(content, target=root / "resume.pdf", layout=layout)
+        )
         rendered_pages = pdf_result.page_count if pdf_result.page_count is not None else final_pages
         result = {
             "status": pdf_result.status,
             "format": "pdf",
+            "task_id": task_id,
+            "checkpoint_version": task.checkpoint_version,
             "snapshot_id": snapshot_id,
             **pdf_result.__dict__,
             "content": content,
@@ -2883,6 +4114,13 @@ async def export_task(
             "estimated_page_count": final_pages,
             "page_count_source": "rendered_pdf" if pdf_result.page_count is not None else "estimate",
             "compliance_status": "one_page" if rendered_pages <= 1 and pdf_result.status == "ready" else "overflow" if rendered_pages > 1 else "preview_pending",
+            "artifact": _task_artifact_descriptor(
+                task_id, pdf_result.path, scope="exports"
+            ),
+        }
+        result["visual_preview"] = {
+            **pdf_result.__dict__,
+            "artifact": result["artifact"],
         }
         if compression is not None:
             result["compression"] = compression
@@ -3077,6 +4315,57 @@ async def restore_backup_api(payload: dict[str, Any] = Body(default_factory=dict
 _BUILTIN_TEMPLATE = """# 中文技术简历\n\n## 个人简介\n\n[待补充]\n\n## 技能清单\n\n[待补充]\n\n## 项目经历\n\n[待补充]\n"""
 
 
+def _resolve_cached_template_source(template_id: str) -> Path:
+    """Resolve one selected template without accepting arbitrary local paths."""
+
+    template_id = str(template_id or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", template_id):
+        raise HTTPException(
+            status_code=422,
+            detail={"error_code": "template_id_invalid", "message": "模板 ID 不合法"},
+        )
+    cache_root = (state().settings.data_root / "templates" / "cache").resolve()
+    template_root = (cache_root / template_id).resolve()
+    if template_root.parent != cache_root:
+        raise HTTPException(
+            status_code=422,
+            detail={"error_code": "template_path_invalid", "message": "模板缓存路径不合法"},
+        )
+    if template_id == "builtin-cn-single-page":
+        return write_preview(_BUILTIN_TEMPLATE, root=template_root, name="template.md").resolve()
+    if not template_root.is_dir():
+        raise HTTPException(
+            status_code=404,
+            detail={"error_code": "template_not_cached", "message": "模板尚未下载到本机"},
+        )
+    metadata_path = template_root / "metadata.json"
+    if metadata_path.is_file():
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            metadata = {}
+        cached_name = Path(str(metadata.get("filename") or "")).name
+        if cached_name:
+            preferred = (template_root / cached_name).resolve()
+            if (
+                preferred.parent == template_root
+                and preferred.is_file()
+                and preferred.suffix.casefold() in {".md", ".markdown", ".docx"}
+            ):
+                return preferred
+    candidates = sorted(
+        item.resolve()
+        for item in template_root.iterdir()
+        if item.is_file() and item.suffix.casefold() in {".md", ".markdown", ".docx"}
+    )
+    if not candidates:
+        raise HTTPException(
+            status_code=404,
+            detail={"error_code": "template_not_cached", "message": "模板缓存文件不存在"},
+        )
+    return candidates[0]
+
+
 def _github_token(payload: dict[str, Any]) -> str | None:
     handle_id = payload.get("credential_handle_id")
     if not handle_id:
@@ -3106,6 +4395,143 @@ def _persist_template_result(result: dict[str, Any]) -> None:
     metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else result
     if state().db_mirror and hasattr(state().db_mirror, "persist_template"):
         state().db_mirror.persist_template(dict(metadata))
+
+
+async def _attach_template_visual_preview(
+    result: dict[str, Any],
+    *,
+    requested: bool,
+) -> dict[str, Any]:
+    """Attach a browser-renderable preview for one already cached template.
+
+    A DOCX preview is generated only for the currently selected template, not
+    for every search result.  This keeps GitHub discovery responsive and avoids
+    returning arbitrary local files: both source and generated PDF must remain
+    under the configured template cache directory.
+    """
+
+    if not requested:
+        return result
+    cache_root = (state().settings.data_root / "templates" / "cache").resolve()
+    raw_path = str(result.get("path") or "").strip()
+    if not raw_path:
+        return {
+            **result,
+            "visual_preview": {
+                "status": "unavailable",
+                "message": "模板尚未下载到本机，无法生成排版预览",
+            },
+        }
+    source = Path(raw_path).resolve()
+    if cache_root != source and cache_root not in source.parents:
+        return {
+            **result,
+            "visual_preview": {
+                "status": "unavailable",
+                "message": "模板路径不在受信任缓存目录内",
+            },
+        }
+    if not source.is_file():
+        return {
+            **result,
+            "visual_preview": {
+                "status": "unavailable",
+                "message": "本机模板缓存文件不存在",
+            },
+        }
+    if source.suffix.casefold() in {".md", ".markdown"}:
+        content = source.read_text(encoding="utf-8-sig")
+        return {
+            **result,
+            "visual_preview": {
+                "status": "ready",
+                "mime_type": "text/markdown",
+                "content": content,
+            },
+        }
+    if source.suffix.casefold() != ".docx":
+        return {
+            **result,
+            "visual_preview": {
+                "status": "unavailable",
+                "message": "该模板格式暂不支持排版预览",
+            },
+        }
+    preview_root = (source.parent / "preview").resolve()
+    if cache_root not in preview_root.parents:
+        return {
+            **result,
+            "visual_preview": {
+                "status": "unavailable",
+                "message": "模板预览目录无效",
+            },
+        }
+    preview_root.mkdir(parents=True, exist_ok=True)
+    pdf_path = preview_root / f"{source.stem}.pdf"
+    needs_render = (
+        not pdf_path.is_file()
+        or pdf_path.stat().st_mtime_ns < source.stat().st_mtime_ns
+    )
+    conversion = None
+    if needs_render:
+        conversion = await asyncio.to_thread(convert_docx_to_pdf, source, pdf_path)
+        if conversion.status != "ready" or not conversion.path:
+            try:
+                browser_html = await asyncio.to_thread(
+                    render_docx_html_preview,
+                    source.read_bytes(),
+                )
+            except (OSError, ValueError):
+                browser_html = ""
+            if browser_html:
+                return {
+                    **result,
+                    "visual_preview": {
+                        "status": "ready",
+                        "mime_type": "text/html",
+                        "content": browser_html,
+                        "approximate_layout": True,
+                        "message": (
+                            "当前环境无法调用 Word/LibreOffice，已生成安全的浏览器排版预览"
+                        ),
+                    },
+                }
+            return {
+                **result,
+                "visual_preview": {
+                    "status": conversion.status,
+                    "message": "；".join(conversion.warnings)
+                    or "无法使用本机 Office 渲染该模板",
+                },
+            }
+    try:
+        data = pdf_path.read_bytes()
+    except OSError as exc:
+        return {
+            **result,
+            "visual_preview": {
+                "status": "unavailable",
+                "message": f"模板 PDF 预览读取失败：{type(exc).__name__}",
+            },
+        }
+    if len(data) > 12 * 1024 * 1024:
+        return {
+            **result,
+            "visual_preview": {
+                "status": "too_large",
+                "message": "模板 PDF 预览超过 12MB，请下载后在 Word 中查看",
+            },
+        }
+    return {
+        **result,
+        "visual_preview": {
+            "status": "ready",
+            "mime_type": "application/pdf",
+            "filename": pdf_path.name,
+            "content_base64": base64.b64encode(data).decode("ascii"),
+            "page_count": conversion.page_count if conversion is not None else None,
+        },
+    }
 
 
 @app.post("/api/templates/search")
@@ -3200,7 +4626,10 @@ async def preview_template(
             "license_allowed": True,
         }
         _persist_template_result(result)
-        return result
+        return await _attach_template_visual_preview(
+            result,
+            requested=bool((payload or {}).get("render_visual", False)),
+        )
     body = payload or {}
     token = _github_token(body)
     health = await _ensure_mcp_server("github")
@@ -3217,7 +4646,15 @@ async def preview_template(
         except MCPClientError:
             remote = {"ok": False, "error_code": "mcp_unavailable"}
         if remote.get("ok") and isinstance(remote.get("data"), dict):
-            return {"template_id": template_id, **dict(remote["data"]), "source": "github_mcp"}
+            result = {
+                "template_id": template_id,
+                **dict(remote["data"]),
+                "source": "github_mcp",
+            }
+            return await _attach_template_visual_preview(
+                result,
+                requested=bool(body.get("render_visual", False)),
+            )
 
     try:
         if body.get("source_url"):
@@ -3241,7 +4678,144 @@ async def preview_template(
             status_code=404,
             detail={"error_code": "template_preview_unavailable", "message": str(exc)},
         ) from exc
-    return {"status": "ready", "template_id": template_id, **direct, "source": "local_fallback"}
+    result = {
+        "status": "ready",
+        "template_id": template_id,
+        **direct,
+        "source": "local_fallback",
+    }
+    return await _attach_template_visual_preview(
+        result,
+        requested=bool(body.get("render_visual", False)),
+    )
+
+
+@app.get("/api/templates/{template_id}/structure")
+async def get_template_structure(
+    template_id: str,
+    _: None = Depends(require_internal_token),
+) -> dict[str, Any]:
+    source = _resolve_cached_template_source(template_id)
+    structure = load_template_structure(template_id, source)
+    if structure is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error_code": "template_structure_not_found",
+                "message": "该模板尚未使用聊天模型解析",
+            },
+        )
+    return structure
+
+
+@app.post("/api/templates/{template_id}/model-parse")
+async def model_parse_template(
+    template_id: str,
+    payload: dict[str, Any] | None = Body(default=None),
+    _: None = Depends(require_internal_token),
+) -> dict[str, Any]:
+    """Map a cached template to editable resume modules with a selected model."""
+
+    source = _resolve_cached_template_source(template_id)
+    body = payload or {}
+    profile_id = str(body.get("chat_profile_id") or "").strip()
+    profile = state().store.get_profile(profile_id) if profile_id else next(
+        (
+            item
+            for item in state().store.list_profiles(ModelRole.CHAT.value)
+            if item.default_for_role and item.status == "ready"
+        ),
+        None,
+    )
+
+    def unavailable(message: str, error_code: str) -> dict[str, Any]:
+        return {
+            "status": "fallback",
+            "template_id": template_id,
+            "structure": None,
+            "retryable": True,
+            "parser": {
+                "parser_mode": "unavailable",
+                "model_profile_id": getattr(profile, "profile_id", None),
+                "model_name": getattr(profile, "model_name", None),
+                "error_code": error_code,
+                "warnings": [message],
+            },
+        }
+
+    if profile is None:
+        return unavailable("请选择一个已经检测成功的聊天模型", "chat_profile_not_found")
+    if profile.role is not ModelRole.CHAT:
+        return unavailable("所选配置不是聊天模型", "invalid_chat_profile_role")
+    if profile.status != "ready":
+        return unavailable("所选聊天模型尚未检测成功", "model_not_ready")
+    handle_id = str(body.get("credential_handle_id") or "").strip() or None
+    if profile.provider is Provider.OPENAI_COMPATIBLE:
+        handle_id = _materialize_model_credential(profile.profile_id, handle_id)
+        if not handle_id or not state().credentials.has(
+            handle_id, scope=f"model:{profile.profile_id}"
+        ):
+            return unavailable("云端模型 API Key 无法恢复", "credential_missing")
+        if (
+            getattr(state().settings, "external_model_consent_required", True)
+            and not state().consents.get("external_model:global", {}).get("granted", False)
+        ):
+            return unavailable(
+                "尚未确认向外部模型发送模板文字",
+                "needs_external_model_consent",
+            )
+    try:
+        structure = await asyncio.to_thread(
+            structure_template_with_model,
+            template_id,
+            source,
+            profile=profile,
+            gateway=state().model_gateway,
+            credential_handle_id=handle_id,
+        )
+    except Exception as exc:
+        from app.core.utils import redact_sensitive
+
+        reason = str(redact_sensitive(str(exc) or type(exc).__name__)).strip()
+        if len(reason) > 240:
+            reason = f"{reason[:237]}..."
+        return unavailable(
+            "聊天模型解析模板结构失败" + (f"。原因：{reason}" if reason else ""),
+            str(getattr(exc, "code", "template_model_parse_failed")),
+        )
+    return structure
+
+
+@app.post("/api/templates/{template_id}/confirm-structure")
+async def confirm_template_structure_endpoint(
+    template_id: str,
+    payload: dict[str, Any] = Body(default_factory=dict),
+    _: None = Depends(require_internal_token),
+) -> dict[str, Any]:
+    source = _resolve_cached_template_source(template_id)
+    try:
+        return confirm_template_structure(
+            template_id,
+            source,
+            structure_id=str(payload.get("structure_id") or ""),
+            source_sha256=str(payload.get("source_sha256") or ""),
+            sections=payload.get("sections"),
+        )
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"error_code": "template_structure_conflict", "message": str(exc)},
+        ) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"error_code": "template_model_parse_required", "message": str(exc)},
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"error_code": "template_structure_invalid", "message": str(exc)},
+        ) from exc
 
 
 @app.post("/api/templates/{template_id}/download")

@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 
-EXCLUDED_PARTS = {"edge-profile", ".internal-token", ".env"}
+EXCLUDED_PARTS = {"edge-profile", "credentials", ".internal-token", ".env"}
 
 
 def _sha256(path: Path) -> str:

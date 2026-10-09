@@ -61,6 +61,7 @@ class JobInput(BaseModel):
     responsibilities: list[str] = Field(default_factory=list, max_length=100)
     requirements: list[str] = Field(default_factory=list, max_length=100)
     skills: list[str] = Field(default_factory=list, max_length=100)
+    hr_name: str | None = Field(default=None, max_length=100)
     hr_activity: str | None = Field(default=None, max_length=100)
     posted_at: datetime | None = None
     posted_at_label: str | None = Field(default=None, max_length=100)
@@ -109,10 +110,11 @@ class ScreenshotConfirmRequest(BaseModel):
 
     ocr_id: str = Field(min_length=1, max_length=100)
     text: str = Field(min_length=1, max_length=200_000)
-    title: str = Field(min_length=1, max_length=200)
+    title: str | None = Field(default=None, max_length=200)
     company: str | None = Field(default=None, max_length=200)
     city: str | None = Field(default=None, max_length=100)
     salary: str | None = Field(default=None, max_length=100)
+    hr_name: str | None = Field(default=None, max_length=100)
     hr_activity: str | None = Field(default=None, max_length=100)
     chat_profile_id: str | None = Field(default=None, max_length=200)
     credential_handle_id: str | None = Field(default=None, max_length=200)
@@ -130,6 +132,7 @@ class ResumeSection(BaseModel):
         "evaluation",
         "certificates",
         "objective",
+        "other",
     ]
     title: str | None = None
     content: str
@@ -182,6 +185,7 @@ class TaskCreateRequest(BaseModel):
     chat_profile_id: str | None = None
     embedding_profile_id: str | None = None
     credential_handle_id: str | None = None
+    embedding_credential_handle_id: str | None = None
     dimension_weights: dict[str, float] | None = None
     component_weights: dict[str, float] | None = None
 
@@ -215,6 +219,7 @@ class ActionRequest(BaseModel):
     action: Literal[
         "approve",
         "reject",
+        "edit",
         "revise",
         "select",
         "skip",
@@ -295,12 +300,14 @@ class TaskView(BaseModel):
     # export/preview clients must bind to this id rather than the mutable job
     # record or the latest draft.
     resume_snapshot_id: str | None = None
+    previous_snapshot_ids: list[str] = Field(default_factory=list)
     template_id: str | None = None
     output_mode: str = "resume_edit"
     requested_output_mode: str = "resume_edit"
     final_product: str | None = None
     selected_candidate_id: str | None = None
     generation_branch_id: str | None = None
+    feedback_classification: dict[str, Any] | None = None
     embedding_mode: str | None = None
     pending_module: str | None = None
     project_decision: dict[str, Any] | None = None

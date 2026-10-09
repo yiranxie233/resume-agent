@@ -1,13 +1,10 @@
 """GitHub Chinese resume-template MCP server."""
-from __future__ import annotations
-
 import os
 import re
 import urllib.error
 from pathlib import Path
 from typing import Any, Callable
 
-from app.mcp.stdio_server import StdioMCPServer
 from app.services.template_service import (
     cache_github_template,
     check_github_template_update,
@@ -202,97 +199,64 @@ def check_update(args: dict[str, Any]) -> dict[str, Any]:
     return _envelope(data=result, requires_user=result["status"] == "update_available")
 
 
-def main() -> None:
-    credential_property = {
-        "github_token": {
-            "type": "string",
-            "description": "Optional write-only token for this call; never persisted",
-        }
-    }
-    server = StdioMCPServer(
+def create_server() -> Any:
+    """Build the GitHub template server with the official FastMCP API."""
+
+    from mcp.server.fastmcp import FastMCP
+
+    server = FastMCP(
         "resume-agent-github",
-        "0.2.0",
-        {
-            "github_search_resume_templates": (
-                {
-                    "description": "Search verified Chinese DOCX/Markdown resume template files",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "query": {"type": "string"},
-                            "language": {
-                                "type": "string",
-                                "enum": ["zh", "zh-CN", "Chinese", "中文"],
-                            },
-                            "file_type": {"type": "string", "enum": ["docx", "md", "markdown"]},
-                            "page": {"type": "integer", "minimum": 1},
-                            "per_page": {"type": "integer", "minimum": 1, "maximum": 5},
-                            **credential_property,
-                        },
-                    },
-                },
-                search,
-            ),
-            "github_get_template_license": (
-                {
-                    "description": "Fetch and evaluate a repository license",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {"repository": {"type": "string"}, **credential_property},
-                        "required": ["repository"],
-                    },
-                },
-                license_info,
-            ),
-            "github_preview_template": (
-                {
-                    "description": (
-                        "Return bounded preview metadata for a remote or cached template"
-                    ),
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "source_url": {"type": "string"},
-                            "template_id": {"type": "string"},
-                            **credential_property,
-                        },
-                    },
-                },
-                preview,
-            ),
-            "github_download_template": (
-                {
-                    "description": "Validate and cache one licensed Chinese resume template",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "source_url": {"type": "string"},
-                            "repository": {"type": "string"},
-                            "file_path": {"type": "string"},
-                            "filename": {"type": "string"},
-                            "remote_version": {"type": "string"},
-                            "confirm_update": {"type": "boolean"},
-                            **credential_property,
-                        },
-                        "required": ["source_url"],
-                    },
-                },
-                download,
-            ),
-            "github_check_template_update": (
-                {
-                    "description": "Compare a cached template with GitHub without overwriting it",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {"template_id": {"type": "string"}, **credential_property},
-                        "required": ["template_id"],
-                    },
-                },
-                check_update,
-            ),
-        },
+        instructions="搜索、校验、预览并缓存有许可证的中文简历模板。",
+        log_level="ERROR",
     )
-    server.run()
+
+    @server.tool(name="github_search_resume_templates", description="搜索中文 DOCX/Markdown 简历模板")
+    def tool_search(
+        query: str = "中文 简历 模板",
+        language: str = "zh",
+        file_type: str | None = None,
+        page: int = 1,
+        per_page: int = 5,
+        github_token: str | None = None,
+    ) -> dict[str, Any]:
+        return search(locals())
+
+    @server.tool(name="github_get_template_license", description="获取并校验仓库许可证")
+    def tool_license(repository: str, github_token: str | None = None) -> dict[str, Any]:
+        return license_info(locals())
+
+    @server.tool(name="github_preview_template", description="生成远程或缓存模板的受限预览")
+    def tool_preview(
+        source_url: str | None = None,
+        template_id: str | None = None,
+        github_token: str | None = None,
+    ) -> dict[str, Any]:
+        return preview(locals())
+
+    @server.tool(name="github_download_template", description="校验并缓存一个中文简历模板")
+    def tool_download(
+        source_url: str,
+        repository: str | None = None,
+        file_path: str | None = None,
+        filename: str | None = None,
+        remote_version: str | None = None,
+        confirm_update: bool = False,
+        github_token: str | None = None,
+    ) -> dict[str, Any]:
+        return download(locals())
+
+    @server.tool(name="github_check_template_update", description="检查缓存模板是否有更新但不覆盖")
+    def tool_check_update(
+        template_id: str,
+        github_token: str | None = None,
+    ) -> dict[str, Any]:
+        return check_update(locals())
+
+    return server
+
+
+def main() -> None:
+    create_server().run(transport="stdio")
 
 
 if __name__ == "__main__":

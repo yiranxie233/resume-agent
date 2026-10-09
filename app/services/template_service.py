@@ -14,14 +14,15 @@ import json
 import os
 import re
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 import zipfile
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-
 
 # These licenses explicitly permit modification and local use without requiring
 # an attribution notice in the rendered resume itself. CC-BY is intentionally
@@ -63,15 +64,27 @@ _RESUME_MARKERS = (
     "简历",
 )
 _PATH_MARKERS = ("中文", "简历", "resume", "cv", "template", "模板")
+_NON_TEMPLATE_PATH_MARKERS = (
+    "readme",
+    "weekly",
+    "question",
+    "prompt",
+    "guide",
+    "article",
+    "blog",
+    "changelog",
+)
 _IGNORED_PATH_PARTS = frozenset(
     {".git", ".github", "node_modules", "vendor", "dist", "build"}
 )
+_WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+_WORD = {"w": _WORD_NS}
 
 
 def template_id_for(repository: str | None, source_url: str | None = None) -> str:
     """Return a stable opaque ID without putting repository text in paths."""
 
-    value = f"{repository or ''}|{source_url or ''}".encode("utf-8")
+    value = f"{repository or ''}|{source_url or ''}".encode()
     return "github-" + hashlib.sha256(value).hexdigest()[:24]
 
 
@@ -127,7 +140,7 @@ def _request_bytes(
     url: str,
     *,
     token: str | None = None,
-    timeout: float = 15.0,
+    timeout: float = 45.0,
     max_bytes: int = MAX_DOWNLOAD_BYTES,
     allowed_hosts: frozenset[str] = ALLOWED_GITHUB_HOSTS,
     accept: str = "application/octet-stream",
@@ -152,19 +165,49 @@ def _request_bytes(
     return data, final_url, content_type
 
 
-def _request_json(url: str, *, token: str | None = None, timeout: float = 10.0) -> Any:
-    data, _, _ = _request_bytes(
-        url,
-        token=token,
-        timeout=timeout,
-        max_bytes=MAX_API_RESPONSE_BYTES,
-        allowed_hosts=_ALLOWED_API_HOSTS,
-        accept="application/vnd.github+json",
-    )
-    try:
-        return json.loads(data.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError("GitHub 返回了无效的 JSON") from exc
+def _request_json(url: str, *, token: str | None = None, timeout: float = 20.0) -> Any:
+    last_error: BaseException | None = None
+    for attempt in range(3):
+        try:
+            data, _, _ = _request_bytes(
+                url,
+                token=token,
+                timeout=timeout,
+                max_bytes=MAX_API_RESPONSE_BYTES,
+                allowed_hosts=_ALLOWED_API_HOSTS,
+                accept="application/vnd.github+json",
+            )
+            return json.loads(data.decode("utf-8"))
+        except urllib.error.HTTPError:
+            # Authentication, rate-limit and not-found responses are stable and
+            # must retain their exact status for the caller's diagnosis.
+            raise
+        except (UnicodeDecodeError, json.JSONDecodeError, urllib.error.URLError, TimeoutError) as exc:
+            last_error = exc
+            if attempt < 2:
+                time.sleep(0.2 * (attempt + 1))
+    raise ValueError("GitHub 返回了无效或不完整的 JSON") from last_error
+
+
+def _request_template_bytes(
+    url: str,
+    *,
+    token: str | None = None,
+    attempts: int = 3,
+) -> tuple[bytes, str, str | None]:
+    """Download a template with bounded retries for slow GitHub raw links."""
+
+    last_error: BaseException | None = None
+    for attempt in range(max(1, attempts)):
+        try:
+            return _request_bytes(url, token=token, timeout=60.0)
+        except urllib.error.HTTPError:
+            raise
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+            last_error = exc
+            if attempt + 1 < attempts:
+                time.sleep(0.5 * (attempt + 1))
+    raise ValueError("GitHub 模板下载超时，请检查网络或启用可访问 GitHub 的代理后重试") from last_error
 
 
 def _license_policy(spdx_id: str | None) -> dict[str, Any]:
@@ -288,6 +331,144 @@ def _extract_template_text(data: bytes, suffix: str) -> str:
     return html.unescape(re.sub(r"<[^>]+>", "", text))
 
 
+def extract_template_text(data: bytes, suffix: str) -> str:
+    """Return bounded plain text from a validated Markdown or DOCX template.
+
+    Template structure analysis deliberately shares the same ZIP, XML-size and
+    encoding gates as preview/download validation instead of opening the
+    untrusted cached file through a second parser.
+    """
+
+    return _extract_template_text(data, str(suffix or "").casefold())
+
+
+def render_docx_html_preview(data: bytes) -> str:
+    """Render a safe, paginated browser preview when no Office PDF exists.
+
+    This deliberately supports Word paragraphs, inline run styling, text boxes
+    and tables without executing macros, external links, embedded objects or
+    active content.  Microsoft Word/LibreOffice PDF remains the exact-layout
+    path; this HTML is the always-available local fallback used for selection.
+    """
+
+    # Reuse the strict package/size validation before parsing any XML.
+    _extract_template_text(data, ".docx")
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            document_xml = archive.read("word/document.xml")
+    except (KeyError, zipfile.BadZipFile) as exc:
+        raise ValueError("DOCX 模板文件结构无效") from exc
+    try:
+        root = ET.fromstring(document_xml)
+    except ET.ParseError as exc:
+        raise ValueError("DOCX 正文 XML 无法解析") from exc
+
+    def attr(element: ET.Element | None, name: str) -> str:
+        if element is None:
+            return ""
+        return str(element.attrib.get(f"{{{_WORD_NS}}}{name}") or "")
+
+    def run_html(run: ET.Element) -> str:
+        pieces: list[str] = []
+        for node in run.iter():
+            if node.tag == f"{{{_WORD_NS}}}t":
+                pieces.append(html.escape(node.text or ""))
+            elif node.tag == f"{{{_WORD_NS}}}tab":
+                pieces.append("&emsp;")
+            elif node.tag in {f"{{{_WORD_NS}}}br", f"{{{_WORD_NS}}}cr"}:
+                pieces.append("<br>")
+        content = "".join(pieces)
+        if not content:
+            return ""
+        properties = run.find("w:rPr", _WORD)
+        styles: list[str] = []
+        if properties is not None:
+            if properties.find("w:b", _WORD) is not None:
+                styles.append("font-weight:700")
+            if properties.find("w:i", _WORD) is not None:
+                styles.append("font-style:italic")
+            if properties.find("w:u", _WORD) is not None:
+                styles.append("text-decoration:underline")
+            color = attr(properties.find("w:color", _WORD), "val")
+            if re.fullmatch(r"[0-9A-Fa-f]{6}", color):
+                styles.append(f"color:#{color}")
+            size = attr(properties.find("w:sz", _WORD), "val")
+            try:
+                size_pt = int(size) / 2
+            except (TypeError, ValueError):
+                size_pt = 0
+            if 5 <= size_pt <= 72:
+                styles.append(f"font-size:{size_pt:g}pt")
+        style_value = ";".join(styles)
+        return f'<span style="{style_value}">{content}</span>' if style_value else content
+
+    def paragraph_html(paragraph: ET.Element) -> str:
+        content = "".join(run_html(run) for run in paragraph.findall(".//w:r", _WORD))
+        if not content:
+            return '<p class="docx-empty">&nbsp;</p>'
+        properties = paragraph.find("w:pPr", _WORD)
+        style_name = attr(
+            properties.find("w:pStyle", _WORD) if properties is not None else None,
+            "val",
+        ).casefold()
+        alignment = attr(
+            properties.find("w:jc", _WORD) if properties is not None else None,
+            "val",
+        ).casefold()
+        alignment = {
+            "center": "center",
+            "right": "right",
+            "both": "justify",
+            "distribute": "justify",
+        }.get(alignment, "left")
+        tag = "p"
+        if style_name in {"title", "标题"}:
+            tag = "h1"
+        elif "heading1" in style_name or "1" == style_name.removeprefix("heading"):
+            tag = "h2"
+        elif "heading2" in style_name or "2" == style_name.removeprefix("heading"):
+            tag = "h3"
+        return f'<{tag} style="text-align:{alignment}">{content}</{tag}>'
+
+    def table_html(table: ET.Element) -> str:
+        rows: list[str] = []
+        for row in table.findall("w:tr", _WORD):
+            cells: list[str] = []
+            for cell in row.findall("w:tc", _WORD):
+                blocks = [paragraph_html(p) for p in cell.findall(".//w:p", _WORD)]
+                cells.append("<td>" + "".join(blocks) + "</td>")
+            if cells:
+                rows.append("<tr>" + "".join(cells) + "</tr>")
+        return "<table>" + "".join(rows) + "</table>" if rows else ""
+
+    body = root.find("w:body", _WORD)
+    if body is None:
+        raise ValueError("DOCX 模板缺少正文")
+    blocks: list[str] = []
+    for child in body:
+        local = child.tag.rsplit("}", 1)[-1]
+        if local == "p":
+            blocks.append(paragraph_html(child))
+        elif local == "tbl":
+            blocks.append(table_html(child))
+    rendered = "".join(blocks).strip()
+    if not rendered:
+        raise ValueError("DOCX 模板没有可预览正文")
+    return (
+        "<style>"
+        "body{margin:0;background:#eef1f5;font-family:'Microsoft YaHei','PingFang SC',sans-serif;}"
+        ".docx-page{box-sizing:border-box;width:min(794px,calc(100% - 24px));min-height:1050px;"
+        "margin:12px auto;padding:48px 56px;background:#fff;box-shadow:0 2px 14px #0002;color:#20242a;}"
+        ".docx-page p{margin:0 0 7px;line-height:1.45;white-space:normal}.docx-page .docx-empty{margin:0;height:7px;}"
+        ".docx-page h1{font-size:22pt;margin:0 0 14px}.docx-page h2{font-size:15pt;margin:12px 0 7px;}"
+        ".docx-page h3{font-size:12pt;margin:9px 0 5px}.docx-page table{width:100%;border-collapse:collapse;margin:8px 0;}"
+        ".docx-page td{border:1px solid #cfd5dc;padding:5px 7px;vertical-align:top}.docx-page td p{margin:0 0 3px;}"
+        "</style><div class='docx-page'>"
+        + rendered
+        + "</div>"
+    )
+
+
 def _preview_metadata(data: bytes, filename: str) -> dict[str, Any]:
     suffix = Path(filename).suffix.lower()
     if suffix not in _ALLOWED_SUFFIXES:
@@ -296,8 +477,29 @@ def _preview_metadata(data: bytes, filename: str) -> dict[str, Any]:
     compact_text = re.sub(r"[ \t]+", " ", text).strip()
     cjk_count = len(_CJK_RE.findall(compact_text))
     markers = [marker for marker in _RESUME_MARKERS if marker in compact_text]
-    if cjk_count < 4 or len(markers) < 2:
-        raise ValueError("文件未通过中文简历模板内容校验")
+    lower_filename = str(filename).casefold()
+    if any(marker in lower_filename for marker in _NON_TEMPLATE_PATH_MARKERS):
+        raise ValueError("文件路径更像说明文档，不是简历模板")
+    if suffix == ".docx":
+        # Word templates frequently place their section titles in floating
+        # text boxes/drawing XML, while document.xml contains the editable
+        # body but not those exact headings. A valid Office package with
+        # substantial Chinese body text and a resume-shaped filename is still
+        # a real template; article rejection is primarily needed for Markdown.
+        resume_filename = any(
+            marker in lower_filename for marker in ("简历", "resume", "cv")
+        )
+        if cjk_count < 20 or not resume_filename:
+            raise ValueError("文件未通过中文简历模板内容校验")
+    else:
+        # A normal article can mention “简历/项目/技能” a few times.  Require a
+        # resume-shaped combination: an identity/contact or objective section,
+        # at least one experience/project section, and skills/education.
+        identity = any(marker in compact_text for marker in ("个人信息", "联系方式", "求职目标", "求职意向"))
+        experience = any(marker in compact_text for marker in ("项目经历", "项目经验", "工作经历", "实习经历"))
+        supporting = any(marker in compact_text for marker in ("专业技能", "技能清单", "教育经历", "教育背景"))
+        if cjk_count < 12 or len(markers) < 3 or not (identity and experience and supporting):
+            raise ValueError("文件未通过中文简历模板内容校验")
     if suffix in {".md", ".markdown"}:
         headings = [
             match.group(1).strip()
@@ -326,9 +528,31 @@ def _preview_metadata(data: bytes, filename: str) -> dict[str, Any]:
 def _path_score(path: str) -> tuple[int, int, str]:
     lower = path.lower()
     marker_score = sum(1 for marker in _PATH_MARKERS if marker in lower)
+    technical_score = sum(
+        1
+        for marker in (
+            "技术",
+            "工程师",
+            "开发",
+            "程序",
+            "互联网",
+            "前端",
+            "后端",
+            "产品经理",
+            "data",
+            "software",
+            "engineer",
+            "developer",
+        )
+        if marker in lower
+    )
     readme_penalty = 2 if Path(path).name.lower().startswith("readme") else 0
     depth_penalty = path.count("/")
-    return (marker_score * 5 - readme_penalty - depth_penalty, -len(path), path)
+    return (
+        marker_score * 5 + technical_score * 4 - readme_penalty - depth_penalty,
+        -len(path),
+        path,
+    )
 
 
 def _tree_candidates(payload: Any, file_type: str | None) -> list[dict[str, Any]]:
@@ -343,6 +567,9 @@ def _tree_candidates(payload: Any, file_type: str | None) -> list[dict[str, Any]
         if not isinstance(item, dict) or item.get("type") != "blob":
             continue
         path = str(item.get("path") or "")
+        lower_path = path.casefold()
+        if any(marker in lower_path for marker in _NON_TEMPLATE_PATH_MARKERS):
+            continue
         parts = {part.lower() for part in Path(path).parts}
         if parts & _IGNORED_PATH_PARTS or Path(path).suffix.lower() not in wanted_suffixes:
             continue
@@ -375,25 +602,47 @@ def search_github_templates(
     query_value = re.sub(r"\s+", " ", str(query or "").strip())[:160]
     if not query_value:
         query_value = "中文 简历 模板"
-    search_query = f"{query_value} 中文 简历 in:name,description,readme"
-    repository_page_size = min(25, max(10, per_page * 4))
-    url = "https://api.github.com/search/repositories?" + urllib.parse.urlencode(
-        {
-            "q": search_query,
-            "sort": "stars",
-            "order": "desc",
-            "page": page,
-            "per_page": repository_page_size,
-        }
-    )
-    payload = _request_json(url, token=token)
-    repositories = payload.get("items", []) if isinstance(payload, dict) else []
-    total_count = int(payload.get("total_count") or 0) if isinstance(payload, dict) else 0
+    # Repository search restricted to name/description avoids high-star
+    # documentation and prompt collections that merely mention “简历” in a
+    # README.  Try a few equivalent Chinese/English queries so five genuinely
+    # different candidates can be offered even when one query is sparse.
+    query_variants = [
+        f'{query_value} in:name,description',
+        '"简历" "模板" in:name,description',
+        '"中文简历" in:name,description',
+        '"resume template" in:name,description',
+    ]
+    repository_page_size = min(50, max(20, per_page * 8))
+    repositories: list[dict[str, Any]] = []
+    total_count = 0
+    seen_repositories: set[str] = set()
+    for variant in query_variants:
+        url = "https://api.github.com/search/repositories?" + urllib.parse.urlencode(
+            {
+                "q": variant,
+                "sort": "stars",
+                "order": "desc",
+                "page": page,
+                "per_page": repository_page_size,
+            }
+        )
+        payload = _request_json(url, token=token)
+        values = payload.get("items", []) if isinstance(payload, dict) else []
+        total_count = max(total_count, int(payload.get("total_count") or 0)) if isinstance(payload, dict) else total_count
+        for item in values:
+            if not isinstance(item, dict):
+                continue
+            repository = str(item.get("full_name") or "")
+            if repository and repository not in seen_repositories:
+                seen_repositories.add(repository)
+                repositories.append(item)
+        if len(repositories) >= repository_page_size:
+            break
     items: list[dict[str, Any]] = []
     warnings: list[dict[str, str]] = []
     scanned = 0
     for repository_item in repositories:
-        if len(items) >= per_page or scanned >= 10:
+        if len(items) >= per_page or scanned >= 25:
             break
         if not isinstance(repository_item, dict):
             continue
@@ -401,6 +650,17 @@ def search_github_templates(
         try:
             repository = _normalise_repository(repository)
         except ValueError:
+            continue
+        repository_name = repository.rsplit("/", 1)[-1].casefold()
+        if not (
+            "resume" in repository_name
+            or re.search(r"(?:^|[-_.])cv(?:$|[-_.])", repository_name)
+            or "简历" in repository_name
+        ):
+            # GitHub's repository search can return a high-star documentation
+            # project because its description briefly mentions resumes. Do not
+            # spend tree/download calls on it: the repository itself must be
+            # resume-focused before file-level validation begins.
             continue
         search_license = repository_item.get("license") or {}
         search_spdx = search_license.get("spdx_id") if isinstance(search_license, dict) else None
@@ -418,16 +678,38 @@ def search_github_templates(
             )
             tree_payload = _request_json(tree_url, token=token)
             candidates = _tree_candidates(tree_payload, type_value)
-            for candidate in candidates[:8]:
+            for candidate in candidates[:12]:
                 source_url = _raw_url(repository, default_branch, str(candidate["path"]))
-                try:
-                    data, final_url, _ = _request_bytes(source_url, token=token)
-                    preview = _preview_metadata(data, str(candidate["path"]))
-                except (ValueError, OSError, urllib.error.URLError):
-                    continue
                 remote_sha = str(candidate.get("sha") or "")
-                if remote_sha and _git_blob_sha(data) != remote_sha:
-                    continue
+                suffix = Path(str(candidate["path"])).suffix.lower()
+                if suffix == ".docx":
+                    # DOCX repositories often contain dozens of multi-megabyte
+                    # variants. Search returns file-level metadata immediately;
+                    # the subsequent visible download stage performs the full
+                    # ZIP, hash, Chinese-content and section validation. This
+                    # avoids downloading every rejected candidate twice before
+                    # the progress bar even reaches “简历下载”.
+                    final_url = source_url
+                    preview = {
+                        "filename": Path(str(candidate["path"])).name,
+                        "file_type": "docx",
+                        "size_bytes": candidate.get("size"),
+                        "detected_sections": [],
+                        "headings": [],
+                        "excerpt": "",
+                        "render_mode": "download_validation_required",
+                        "requires_office_render": True,
+                        "language": "zh",
+                        "validation_stage": "download",
+                    }
+                else:
+                    try:
+                        data, final_url, _ = _request_bytes(source_url, token=token)
+                        preview = _preview_metadata(data, str(candidate["path"]))
+                    except (ValueError, OSError, urllib.error.URLError):
+                        continue
+                    if remote_sha and _git_blob_sha(data) != remote_sha:
+                        continue
                 html_url = "https://github.com/{}/blob/{}/{}".format(
                     repository,
                     urllib.parse.quote(default_branch, safe=""),
@@ -457,12 +739,13 @@ def search_github_templates(
                         "preview_metadata": preview,
                     }
                 )
-                break
+                if len(items) >= per_page:
+                    break
         except (ValueError, OSError, urllib.error.URLError) as exc:
             warnings.append({"repository": repository, "reason": type(exc).__name__})
             continue
     items.sort(key=lambda item: (-int(item.get("stars", 0)), str(item.get("repository") or "")))
-    has_more = page * repository_page_size < total_count
+    has_more = page * repository_page_size < total_count or len(items) < per_page
     return {
         "query": query_value,
         "language": "zh",
@@ -480,7 +763,7 @@ def preview_github_template(url: str, *, token: str | None = None) -> dict[str, 
     """Fetch an allowed GitHub file and return bounded preview metadata."""
 
     repository, ref, path = _source_descriptor(url)
-    data, final_url, _ = _request_bytes(
+    data, final_url, _ = _request_template_bytes(
         _downloadable_url(url, repository, ref, path), token=token
     )
     preview = _preview_metadata(data, path)
@@ -542,7 +825,7 @@ def download_github_file(
         raise ValueError("只允许 Markdown 或 DOCX 模板")
     if Path(safe_name).suffix.lower() != source_suffix:
         raise ValueError("模板文件名与来源文件类型不匹配")
-    data, final_url, _ = _request_bytes(
+    data, final_url, _ = _request_template_bytes(
         _downloadable_url(url, inferred_repository, ref, source_path), token=token
     )
     preview = _preview_metadata(data, safe_name)
@@ -772,6 +1055,7 @@ __all__ = [
     "cache_github_template",
     "check_github_template_update",
     "download_github_file",
+    "extract_template_text",
     "get_github_file_version",
     "get_github_repository_license",
     "preview_cached_template",

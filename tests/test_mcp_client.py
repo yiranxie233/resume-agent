@@ -108,6 +108,18 @@ class MCPClientManagerTests(unittest.IsolatedAsyncioTestCase):
             str(detected.resolve()),
         )
 
+    def test_default_boss_spec_uses_durable_data_root_profile(self) -> None:
+        data_root = Path.cwd() / "data" / "test-edge-data"
+        with patch("app.mcp.edge_adapter.detect_edge_path", return_value=None):
+            specs = default_server_specs(
+                project_root=Path.cwd(), data_root=data_root
+            )
+
+        self.assertEqual(
+            specs["boss"].env["RESUME_AGENT_EDGE_PROFILE_DIR"],
+            str((data_root / "edge-profile").resolve()),
+        )
+
     async def test_sync_tool_runs_outside_mcp_event_loop(self) -> None:
         from app.mcp.stdio_server import StdioMCPServer
 

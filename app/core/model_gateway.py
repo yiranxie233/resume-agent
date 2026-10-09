@@ -16,6 +16,8 @@ import json
 import math
 import secrets
 import shutil
+import socket
+import ssl
 import threading
 import time
 import urllib.error
@@ -187,8 +189,13 @@ class GenerationParameters:
     temperature: float = 0.2
     top_p: float = 1.0
     max_output_tokens: int = 1200
-    timeout_seconds: float = 60.0
-    max_retries: int = 2
+    # A multi-candidate Chinese project block is substantially larger than a
+    # connectivity probe or a short JD correction.  Several compatible
+    # relays need more than 60 seconds to finish that structured response.
+    # Keep the total default retry window below the workflow's 300-second
+    # guard while allowing one slow but healthy response to complete.
+    timeout_seconds: float = 120.0
+    max_retries: int = 1
     retry_interval_seconds: float = 0.5
 
     def __post_init__(self) -> None:
@@ -239,6 +246,7 @@ class ModelProfile:
     model_name: str
     profile_version: str = "v1"
     credential_required: bool = False
+    auth_scheme: str = "bearer"
     context_window_tokens: int | None = None
     tokenizer_id: str | None = None
     tokenizer_version: str | None = None
@@ -257,6 +265,10 @@ class ModelProfile:
             raise ValueError("profile_id and model_name are required")
         normalized = normalize_base_url(self.base_url)
         object.__setattr__(self, "base_url", normalized)
+        auth_scheme = str(self.auth_scheme or "bearer").strip().casefold()
+        if auth_scheme not in {"bearer", "raw"}:
+            raise ValueError("auth_scheme must be bearer or raw")
+        object.__setattr__(self, "auth_scheme", auth_scheme)
         if provider is Provider.OPENAI_COMPATIBLE:
             _assert_external_https(self)
         if self.context_window_tokens is not None and self.context_window_tokens <= 0:
@@ -296,6 +308,7 @@ class ModelProfile:
             "model_name": self.model_name,
             "profile_version": self.profile_version,
             "credential_required": self.credential_required,
+            "auth_scheme": self.auth_scheme,
             "context_window_tokens": self.context_window_tokens,
             "tokenizer_id": self.tokenizer_id,
             "tokenizer_version": self.tokenizer_version,
@@ -355,6 +368,7 @@ class ModelProfile:
                     "profile_version",
                     "config_version",
                     "credential_required",
+                    "auth_scheme",
                     "context_window_tokens",
                     "tokenizer_id",
                     "tokenizer_version",
@@ -380,6 +394,7 @@ class ModelProfile:
             model_name=str(data["model_name"]),
             profile_version=str(version or "v1"),
             credential_required=bool(data.get("credential_required", False)),
+            auth_scheme=str(data.get("auth_scheme") or generation_data.get("auth_scheme") or "bearer"),
             context_window_tokens=data.get("context_window_tokens"),
             tokenizer_id=data.get("tokenizer_id"),
             tokenizer_version=data.get("tokenizer_version"),
@@ -570,9 +585,37 @@ class UrllibTransport:
                 body=body,
             )
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            raise GatewayError(
-                "service_unreachable", str(exc), retryable=True
-            ) from exc
+            reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+            message = str(reason or exc)
+            lowered = message.casefold()
+            if isinstance(reason, ssl.SSLCertVerificationError) or "certificate verify failed" in lowered:
+                code = "tls_certificate_error"
+                public_message = "HTTPS 证书校验失败，请检查系统时间或服务商证书"
+            elif isinstance(reason, socket.gaierror) or any(
+                marker in lowered
+                for marker in ("name or service not known", "getaddrinfo failed", "nodename nor servname")
+            ):
+                code = "dns_resolution_failed"
+                public_message = "域名解析失败，请检查 Base URL 和本机 DNS"
+            elif isinstance(reason, (TimeoutError, socket.timeout)) or "timed out" in lowered:
+                code = "connection_timeout"
+                public_message = "连接服务商超时，请检查网络、代理或服务状态"
+            elif isinstance(reason, ConnectionRefusedError) or "connection refused" in lowered:
+                code = "connection_refused"
+                public_message = "服务商拒绝连接，请检查 Base URL 和服务状态"
+            elif isinstance(reason, PermissionError) or any(
+                marker in lowered
+                for marker in ("winerror 10013", "access permissions", "访问套接字")
+            ):
+                code = "network_permission_denied"
+                public_message = "当前后端进程没有访问外部网络的权限，请在普通本机终端中启动服务"
+            elif "proxy" in lowered:
+                code = "proxy_connection_failed"
+                public_message = "代理连接失败，请检查 HTTP_PROXY/HTTPS_PROXY 或系统代理"
+            else:
+                code = "service_unreachable"
+                public_message = "无法连接模型服务，请检查 Base URL、网络和代理设置"
+            raise GatewayError(code, public_message, retryable=True) from exc
 
 
 def normalize_base_url(value: str) -> str:
@@ -589,6 +632,25 @@ def normalize_base_url(value: str) -> str:
     if parsed.fragment:
         raise ValueError("base_url must not contain a fragment")
     return value
+
+
+def canonicalize_openai_base_url(value: str) -> str:
+    """Return the API root even when a user pastes a concrete endpoint."""
+
+    normalized = normalize_base_url(value)
+    parsed = urllib.parse.urlparse(normalized)
+    path = parsed.path.rstrip("/")
+    lowered = path.casefold()
+    for suffix in ("/chat/completions", "/embeddings", "/models", "/responses"):
+        if lowered.endswith(suffix):
+            path = path[: -len(suffix)].rstrip("/")
+            lowered = path.casefold()
+            break
+    if not lowered.endswith("/v1"):
+        path = f"{path}/v1" if path else "/v1"
+    return urllib.parse.urlunparse(
+        (parsed.scheme, parsed.netloc, path, "", "", "")
+    )
 
 
 def _is_local_url(url: str) -> bool:
@@ -608,11 +670,7 @@ def _endpoint(base_url: str, path: str) -> str:
 
 
 def _openai_endpoint(base_url: str, path: str) -> str:
-    base = base_url.rstrip("/")
-    # Treat a trailing /v1 as the API root and add it exactly once otherwise.
-    if not base.lower().endswith("/v1"):
-        base += "/v1"
-    return _endpoint(base, path)
+    return _endpoint(canonicalize_openai_base_url(base_url), path)
 
 
 def _headers_for(profile: ModelProfile, secret: str | None) -> dict[str, str]:
@@ -621,7 +679,9 @@ def _headers_for(profile: ModelProfile, secret: str | None) -> dict[str, str]:
         if profile.credential_required and not secret:
             raise CredentialUnavailable()
         if secret:
-            headers["Authorization"] = f"Bearer {secret}"
+            headers["Authorization"] = (
+                secret if profile.auth_scheme == "raw" else f"Bearer {secret}"
+            )
     return headers
 
 
@@ -1197,9 +1257,6 @@ class OpenAICompatibleAdapter(_BaseAdapter):
                     body={
                         "model": profile.model_name,
                         "messages": [{"role": "user", "content": 'Return exactly {"ok":true}'}],
-                        "temperature": 0,
-                        "max_tokens": 16,
-                        "response_format": {"type": "json_object"},
                     },
                     secret=secret,
                 )
@@ -1267,6 +1324,12 @@ class OpenAICompatibleAdapter(_BaseAdapter):
         except GatewayError as exc:
             status = {
                 "service_unreachable": ProbeStatus.SERVICE_UNREACHABLE,
+                "network_permission_denied": ProbeStatus.SERVICE_UNREACHABLE,
+                "dns_resolution_failed": ProbeStatus.SERVICE_UNREACHABLE,
+                "connection_timeout": ProbeStatus.SERVICE_UNREACHABLE,
+                "connection_refused": ProbeStatus.SERVICE_UNREACHABLE,
+                "proxy_connection_failed": ProbeStatus.SERVICE_UNREACHABLE,
+                "tls_certificate_error": ProbeStatus.SERVICE_UNREACHABLE,
                 "auth_failed": ProbeStatus.AUTH_FAILED,
                 "capability_mismatch": ProbeStatus.CAPABILITY_MISMATCH,
             }.get(exc.code, ProbeStatus.PROBE_FAILED)
@@ -1304,21 +1367,106 @@ class OpenAICompatibleAdapter(_BaseAdapter):
         }
         if response_format:
             body["response_format"] = response_format
-        response = self._with_retries(
-            lambda: self._request(
-                profile,
-                "POST",
-                _openai_endpoint(profile.base_url, "/chat/completions"),
-                body=body,
-                secret=secret,
-            ),
-            retries=profile.generation.max_retries,
-            interval=profile.generation.retry_interval_seconds,
-        )
+
+        def request(payload: Mapping[str, Any]) -> HttpResponse:
+            return self._with_retries(
+                lambda: self._request(
+                    profile,
+                    "POST",
+                    _openai_endpoint(profile.base_url, "/chat/completions"),
+                    body=payload,
+                    secret=secret,
+                ),
+                retries=profile.generation.max_retries,
+                interval=profile.generation.retry_interval_seconds,
+            )
+
+        request_body = body
+        try:
+            response = request(request_body)
+        except GatewayError as exc:
+            # Some OpenAI-compatible relays implement Chat Completions but not
+            # response_format.  The caller's prompt still requests JSON and the
+            # domain parser validates it locally, so retry once without the
+            # optional extension instead of rejecting an otherwise usable model.
+            if not (
+                response_format
+                and exc.code == "provider_http_error"
+                and exc.status_code in {400, 422}
+            ):
+                raise
+            fallback_body = dict(body)
+            fallback_body.pop("response_format", None)
+            request_body = fallback_body
+            response = request(request_body)
         data = response.json()
-        content = _extract_openai_chat_text(data)
-        if not content:
-            raise GatewayError("invalid_response", "chat response has no content")
+        first_finish = _extract_openai_finish_reason(data)
+        length_reasons = {"length", "max_tokens", "max_output_tokens"}
+        content = _extract_openai_chat_text(
+            data,
+            include_reasoning=first_finish not in length_reasons,
+        )
+        # A non-empty answer can still be an unusable partial JSON document
+        # when a relay reports ``finish_reason=length``.  Treat structured
+        # output atomically and retry with a larger budget in the same call.
+        truncated_structured = bool(
+            content and response_format and first_finish in length_reasons
+        )
+        if not content or truncated_structured:
+            # Reasoning-capable OpenAI-compatible relays may spend the small
+            # default completion budget entirely on hidden reasoning and return
+            # ``finish_reason=length`` with an empty final content field.  This
+            # is unrelated to the API key and re-saving the same credential
+            # cannot fix it.  Retry once with a useful structured-output budget;
+            # remove the optional response_format extension as some relays also
+            # return an empty 200 response instead of rejecting that parameter.
+            refusal = _extract_openai_refusal_text(data)
+            if refusal:
+                raise GatewayError(
+                    "model_refused",
+                    f"模型拒绝生成内容：{refusal[:200]}",
+                    requires_user=True,
+                )
+            if first_finish not in length_reasons:
+                raise GatewayError(
+                    "invalid_response",
+                    "模型接口返回成功状态，但响应中没有可用正文",
+                    retryable=True,
+                )
+            retry_body = dict(request_body)
+            retry_body.pop("response_format", None)
+            original_limit = _safe_positive_int(retry_body.get("max_tokens"), default=1200)
+            retry_ceiling = min(
+                _safe_positive_int(profile.context_window_tokens, default=16384),
+                16384,
+            )
+            retry_body["max_tokens"] = min(
+                max(original_limit * 4, min(8192, retry_ceiling)),
+                retry_ceiling,
+            )
+            retry_response = request(retry_body)
+            retry_data = retry_response.json()
+            retry_finish = _extract_openai_finish_reason(retry_data)
+            retry_content = _extract_openai_chat_text(
+                retry_data,
+                include_reasoning=retry_finish not in length_reasons,
+            )
+            if retry_content and retry_finish not in length_reasons:
+                data = retry_data
+                content = retry_content
+            else:
+                retry_refusal = _extract_openai_refusal_text(retry_data)
+                if retry_refusal:
+                    raise GatewayError(
+                        "model_refused",
+                        f"模型拒绝生成内容：{retry_refusal[:200]}",
+                        requires_user=True,
+                    )
+                raise GatewayError(
+                    "output_token_limit",
+                    "模型扩大输出额度后仍未返回完整正文；请提高该配置的最大输出 Token 或换用非深度思考模型",
+                    retryable=True,
+                )
         usage = data.get("usage") if isinstance(data, Mapping) and isinstance(data.get("usage"), Mapping) else {}
         choices = data.get("choices") if isinstance(data, Mapping) else []
         finish = None
@@ -1536,21 +1684,154 @@ def _extract_ollama_chat_text(data: Any) -> str:
     return ""
 
 
-def _extract_openai_chat_text(data: Any) -> str:
+def _extract_openai_chat_text(data: Any, *, include_reasoning: bool = True) -> str:
+    """Extract text from common Chat Completions/relay response variants.
+
+    Several OpenAI-compatible gateways wrap the response, return Responses-API
+    style output blocks, or put JSON arguments in a function/tool call.  A few
+    reasoning models expose the final payload through ``reasoning_content``.
+    The extraction order always prefers the public final answer and only uses
+    reasoning text as a last-resort compatibility path.
+    """
+
+    if not isinstance(data, Mapping):
+        return ""
+
+    final_candidates: list[str] = []
+    tool_candidates: list[str] = []
+    reasoning_candidates: list[str] = []
+
+    def append_text(target: list[str], value: Any) -> None:
+        text = _openai_text_value(value)
+        if text:
+            target.append(text)
+
+    choices = data.get("choices")
+    if isinstance(choices, Sequence) and not isinstance(choices, (str, bytes)):
+        for choice in choices:
+            if not isinstance(choice, Mapping):
+                continue
+            message = choice.get("message")
+            if isinstance(message, Mapping):
+                append_text(final_candidates, message.get("content"))
+                append_text(final_candidates, message.get("output_text"))
+                append_text(reasoning_candidates, message.get("reasoning_content"))
+                append_text(reasoning_candidates, message.get("reasoning"))
+                function_call = message.get("function_call")
+                if isinstance(function_call, Mapping):
+                    append_text(tool_candidates, function_call.get("arguments"))
+                tool_calls = message.get("tool_calls")
+                if isinstance(tool_calls, Sequence) and not isinstance(tool_calls, (str, bytes)):
+                    for tool_call in tool_calls:
+                        if not isinstance(tool_call, Mapping):
+                            continue
+                        function = tool_call.get("function")
+                        if isinstance(function, Mapping):
+                            append_text(tool_candidates, function.get("arguments"))
+                        append_text(tool_candidates, tool_call.get("arguments"))
+            delta = choice.get("delta")
+            if isinstance(delta, Mapping):
+                append_text(final_candidates, delta.get("content"))
+                append_text(reasoning_candidates, delta.get("reasoning_content"))
+            append_text(final_candidates, choice.get("text"))
+            append_text(reasoning_candidates, choice.get("reasoning_content"))
+
+    append_text(final_candidates, data.get("output_text"))
+    output = data.get("output")
+    if isinstance(output, Sequence) and not isinstance(output, (str, bytes)):
+        for item in output:
+            if not isinstance(item, Mapping):
+                continue
+            append_text(final_candidates, item.get("content"))
+            append_text(final_candidates, item.get("text"))
+            append_text(reasoning_candidates, item.get("reasoning_content"))
+
+    # Some relay services wrap the provider payload under one extra object.
+    for envelope_key in ("data", "result", "response"):
+        nested = data.get(envelope_key)
+        if isinstance(nested, Mapping) and nested is not data:
+            append_text(
+                final_candidates,
+                _extract_openai_chat_text(
+                    nested,
+                    include_reasoning=include_reasoning,
+                ),
+            )
+
+    ordered_candidates = [final_candidates, tool_candidates]
+    if include_reasoning:
+        ordered_candidates.append(reasoning_candidates)
+    for candidates in ordered_candidates:
+        for candidate in candidates:
+            text = candidate.strip()
+            if text:
+                return text
+    return ""
+
+
+def _openai_text_value(value: Any) -> str:
+    """Flatten one provider text/content-block value without Python repr."""
+
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, Mapping):
+        for key in ("value", "text", "content", "output_text"):
+            nested = value.get(key)
+            text = _openai_text_value(nested)
+            if text:
+                return text
+        return ""
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return "".join(
+            text
+            for item in value
+            if (text := _openai_text_value(item))
+        ).strip()
+    return ""
+
+
+def _extract_openai_finish_reason(data: Any) -> str | None:
+    if not isinstance(data, Mapping):
+        return None
+    choices = data.get("choices")
+    if isinstance(choices, Sequence) and not isinstance(choices, (str, bytes)):
+        for choice in choices:
+            if isinstance(choice, Mapping) and choice.get("finish_reason"):
+                return str(choice["finish_reason"]).strip().casefold()
+    for key in ("data", "result", "response"):
+        nested = data.get(key)
+        result = _extract_openai_finish_reason(nested)
+        if result:
+            return result
+    return None
+
+
+def _extract_openai_refusal_text(data: Any) -> str:
     if not isinstance(data, Mapping):
         return ""
     choices = data.get("choices")
-    if not isinstance(choices, Sequence) or isinstance(choices, (str, bytes)) or not choices:
-        return ""
-    first = choices[0]
-    if not isinstance(first, Mapping):
-        return ""
-    message = first.get("message")
-    if isinstance(message, Mapping) and message.get("content") is not None:
-        return str(message.get("content"))
-    if first.get("text") is not None:
-        return str(first.get("text"))
+    if isinstance(choices, Sequence) and not isinstance(choices, (str, bytes)):
+        for choice in choices:
+            if not isinstance(choice, Mapping):
+                continue
+            message = choice.get("message")
+            if isinstance(message, Mapping):
+                refusal = _openai_text_value(message.get("refusal"))
+                if refusal:
+                    return refusal
+    for key in ("data", "result", "response"):
+        refusal = _extract_openai_refusal_text(data.get(key))
+        if refusal:
+            return refusal
     return ""
+
+
+def _safe_positive_int(value: Any, *, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
 
 
 def _extract_tool_calls(data: Any) -> list[Any]:

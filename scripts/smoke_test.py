@@ -2,13 +2,19 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import time
+from pathlib import Path
 
 from fastapi.testclient import TestClient
 
 # Smoke tests exercise the non-model parts without requiring a downloaded
 # Ollama model.  Normal application startup keeps the strict model gate on.
 os.environ.setdefault("RESUME_AGENT_STRICT_MODEL_GATE", "false")
+_smoke_root = tempfile.TemporaryDirectory(prefix="resume-agent-smoke-")
+_smoke_db = Path(_smoke_root.name) / "smoke.db"
+os.environ["RESUME_AGENT_DATA_ROOT"] = _smoke_root.name
+os.environ["RESUME_AGENT_DATABASE_URL"] = f"sqlite+pysqlite:///{_smoke_db.as_posix()}"
 
 from app.core.utils import sha256_text
 from app.main import app
@@ -47,7 +53,7 @@ def main() -> None:
         )
         task_response.raise_for_status()
         task_id = task_response.json()["task_id"]
-        for _ in range(30):
+        for _ in range(200):
             time.sleep(0.1)
             task = client.get(f"/api/tasks/{task_id}", headers=headers).json()
             if task["status"] not in {"queued", "running"}:

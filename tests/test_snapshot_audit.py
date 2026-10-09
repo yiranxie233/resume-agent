@@ -76,6 +76,18 @@ class SnapshotAuditTests(unittest.TestCase):
                 "resume_snapshot_id": "resume-snapshot-audit",
                 "final_confirmation": True,
                 "output_mode": "resume_edit",
+                "requested_output_mode": "template_resume",
+                "final_product": "full_resume",
+                "template_id": "builtin-cn-single-page",
+                "template_structure_snapshot": {
+                    "structure_id": "template-structure-audit",
+                    "confirmed_structure_hash": "confirmed-hash",
+                },
+                "base_facts": {
+                    "name": "张三",
+                    "objective": "Python 工程师",
+                    "api_key": "must-not-survive",
+                },
                 "project_patch": {
                     "patch_id": "project-patch-audit",
                     "target_module": "projects",
@@ -122,6 +134,16 @@ class SnapshotAuditTests(unittest.TestCase):
         loaded = self.mirror.load_resume_snapshot("resume-snapshot-audit", task_id=task.task_id)
         self.assertEqual(loaded["materialized"]["state"]["selected_candidate"], "candidate-audit")
         self.assertEqual(loaded["materialized"]["resume"]["resume_id"], "resume-audit")
+        materialized_state = loaded["materialized"]["state"]
+        self.assertEqual(materialized_state["template_id"], "builtin-cn-single-page")
+        self.assertEqual(materialized_state["requested_output_mode"], "template_resume")
+        self.assertEqual(materialized_state["final_product"], "full_resume")
+        self.assertEqual(materialized_state["base_facts"]["name"], "张三")
+        self.assertNotIn("api_key", materialized_state["base_facts"])
+        self.assertEqual(
+            materialized_state["template_structure_snapshot"]["structure_id"],
+            "template-structure-audit",
+        )
 
     def test_stale_resume_patch_is_recorded_as_conflicted(self) -> None:
         task = self._task(project_hash=sha256_text("stale"))
