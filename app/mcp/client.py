@@ -135,7 +135,7 @@ def _load_official_client_sdk() -> _OfficialClientSDK:
 async def official_stdio_connector(spec: MCPServerSpec):
     """Open one official SDK stdio session with child stderr discarded.
 
-    Tool arguments may contain a session-only GitHub token.  Child stderr is
+    Tool arguments may contain a write-only Gitee access token. Child stderr is
     therefore routed to the OS null device instead of application logs, while
     stdout remains reserved exclusively for MCP framing.
     """
@@ -565,7 +565,7 @@ class MCPStdioClient:
 
 
 class MCPClientManager:
-    """Own BOSS/GitHub MCP clients for an application lifespan."""
+    """Own BOSS/Gitee MCP clients for an application lifespan."""
 
     def __init__(
         self,
@@ -694,13 +694,13 @@ def default_server_specs(
             env=child_env,
             call_timeout_seconds=90.0,
         ),
-        "github": MCPServerSpec(
-            name="github",
+        "gitee": MCPServerSpec(
+            name="gitee",
             command=executable,
-            args=("-m", "app.mcp.github_server"),
+            args=("-m", "app.mcp.gitee_server"),
             cwd=root,
             env=child_env,
-            call_timeout_seconds=30.0,
+            call_timeout_seconds=90.0,
         ),
     }
 

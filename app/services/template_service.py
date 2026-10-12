@@ -469,7 +469,12 @@ def render_docx_html_preview(data: bytes) -> str:
     )
 
 
-def _preview_metadata(data: bytes, filename: str) -> dict[str, Any]:
+def _preview_metadata(
+    data: bytes,
+    filename: str,
+    *,
+    trusted_resume_directory: bool = False,
+) -> dict[str, Any]:
     suffix = Path(filename).suffix.lower()
     if suffix not in _ALLOWED_SUFFIXES:
         raise ValueError("只允许 Markdown 或 DOCX 模板")
@@ -489,7 +494,7 @@ def _preview_metadata(data: bytes, filename: str) -> dict[str, Any]:
         resume_filename = any(
             marker in lower_filename for marker in ("简历", "resume", "cv")
         )
-        if cjk_count < 20 or not resume_filename:
+        if cjk_count < 20 or (not resume_filename and not trusted_resume_directory):
             raise ValueError("文件未通过中文简历模板内容校验")
     else:
         # A normal article can mention “简历/项目/技能” a few times.  Require a

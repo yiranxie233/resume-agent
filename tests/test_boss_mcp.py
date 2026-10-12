@@ -381,6 +381,10 @@ class EdgeAdapterTests(unittest.TestCase):
         login_probe = page.evaluate.call_args_list[1].args[0]
         self.assertIn("登录/注册", login_probe)
         self.assertIn("header a", login_probe)
+        self.assertIn(".user-nav a", login_probe)
+        self.assertIn("topBand", login_probe)
+        self.assertIn("rightBand", login_probe)
+        self.assertIn("登录注册", login_probe)
 
     def test_search_replaces_card_hint_with_verified_detail_recruiter_pair(self) -> None:
         root = Path(self.temp.name)
@@ -504,7 +508,11 @@ class EdgeAdapterTests(unittest.TestCase):
         )
         page = Mock()
         page.is_closed.return_value = False
-        page.evaluate.return_value = {"hr_name": "李女士", "hr_activity": "两周活跃"}
+        page.evaluate.return_value = {
+            "hr_name": "李女士",
+            "hr_activity": "两周活跃",
+            "recruiter_found": True,
+        }
         browser._context = Mock()  # type: ignore[assignment]
         browser._page = page  # type: ignore[assignment]
 
@@ -528,8 +536,40 @@ class EdgeAdapterTests(unittest.TestCase):
         self.assertIn("程女士在线", script)
         self.assertIn("semanticRecruiterRoots", script)
         self.assertIn("boss-info-box", script)
-        self.assertIn("Atomic pair", script)
+        self.assertIn("same DOM result in consecutive polls", script)
         self.assertNotIn("window.open", script)
+
+    def test_activity_enrichment_accepts_verified_recruiter_without_status(self) -> None:
+        browser = PlaywrightEdgeBrowser(
+            Path(self.temp.name) / "blank-activity-profile", edge_path=__file__
+        )
+        page = Mock()
+        page.is_closed.return_value = False
+        page.evaluate.return_value = {
+            "hr_name": "徐先生",
+            "hr_activity": "未显示活跃状态",
+            "recruiter_found": True,
+        }
+        browser._context = Mock()  # type: ignore[assignment]
+        browser._page = page  # type: ignore[assignment]
+
+        result = browser.enrich_search_activities(
+            [
+                {
+                    "url": "https://www.zhipin.com/job_detail/example.html",
+                    "title": "AI 应用开发工程师",
+                    "company": "示例公司",
+                    "hr_activity": "活跃时间待解析",
+                }
+            ]
+        )
+
+        self.assertEqual(result[0]["hr_name"], "徐先生")
+        self.assertEqual(result[0]["hr_activity"], "未显示活跃状态")
+        script = page.evaluate.call_args.args[0]
+        self.assertIn("stableBlankRecruiter", script)
+        self.assertIn("correctTitle && correctCompany", script)
+        self.assertNotIn("correctCompany || selectedCard", script)
 
     def test_collection_shutdown_closes_each_tab_in_reverse_order(self) -> None:
         browser = PlaywrightEdgeBrowser(
@@ -1227,6 +1267,8 @@ class EdgeAdapterTests(unittest.TestCase):
         self.assertEqual(fields["description"], "岗位职责：负责 FastAPI 服务开发")
         script = page.evaluate.call_args.args[0]
         self.assertIn("const description = () =>", script)
+        self.assertIn("const recruiter = () =>", script)
+        self.assertIn("hr_recruiter_found", script)
         self.assertIn("'.job-sec-text'", script)
         self.assertIn("description: description()", script)
         self.assertNotIn("description: text(['.job-sec-text'", script)

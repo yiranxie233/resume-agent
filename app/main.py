@@ -72,12 +72,19 @@ from app.services.export_service import (
 )
 from app.services.backup_service import create_backup, restore_backup, validate_backup
 from app.services.template_service import (
-    cache_github_template,
-    check_github_template_update,
     preview_cached_template,
-    preview_github_template,
     render_docx_html_preview,
-    search_github_templates,
+)
+from app.services.gitee_template_service import (
+    GITEE_CREDENTIAL_ID,
+    GITEE_REPOSITORY,
+    GITEE_TEMPLATE_PATH,
+    GiteeAPIError,
+    cache_gitee_template,
+    check_gitee_template_update,
+    list_gitee_templates,
+    preview_gitee_template,
+    probe_gitee_access,
 )
 from app.services.template_llm_parser import (
     confirm_template_structure,
@@ -193,12 +200,13 @@ class AppState:
         self.secret_store = EncryptedSecretStore(
             self.settings.data_root / "credentials" / "model-secrets.json"
         )
-        self.credential_scopes: dict[str, set[str]] = {"model": set(), "github": set()}
+        self.credential_scopes: dict[str, set[str]] = {"model": set(), "gitee": set()}
         # Profile-to-handle bindings are process-local only.  They let every
         # model operation reuse a saved API key without asking Streamlit to
         # keep an opaque handle alive across reruns.  The map never contains
         # plaintext and is rebuilt from the encrypted machine-local store.
         self.model_credential_handles: dict[str, str] = {}
+        self.gitee_credential_handle: str | None = None
         self.credential_registry_lock = threading.RLock()
         from app.core.model_gateway import ModelGateway
 
@@ -219,7 +227,8 @@ class AppState:
         self.mcp_start_task: asyncio.Task[Any] | None = None
         # Consent contains no credential material and is persisted separately.
         # Model API keys may be recovered from the machine-local encrypted
-        # store into short-lived handles; GitHub tokens remain process-local.
+        # store into long-lived process handles. Gitee credentials use the same
+        # encrypted machine-local boundary and a separate scope.
         self.consents: dict[str, dict[str, Any]] = {}
         self.skill_versions: list[dict[str, Any]] = []
         self.skill_path = self.settings.data_root / "skills" / "resume-preferences.md"
@@ -247,6 +256,8 @@ class AppState:
                 # contains ordinary preferences and versioned feature flags.
                 persisted_settings.pop("api_key", None)
                 persisted_settings.pop("github_token", None)
+                persisted_settings.pop("gitee_token", None)
+                persisted_settings.pop("gitee_access_token", None)
                 self.store.settings.update(persisted_settings)
             self.consents.update(self.db_mirror.load_consents())
         for profile in _default_profiles(self.settings):
@@ -288,6 +299,18 @@ class AppState:
                 continue
             self.model_credential_handles[profile.profile_id] = handle.handle_id
             self.credential_scopes["model"].add(handle.handle_id)
+        try:
+            gitee_secret = self.secret_store.get(GITEE_CREDENTIAL_ID)
+            if gitee_secret:
+                gitee_handle = self.credentials.put(
+                    gitee_secret,
+                    scope="gitee",
+                    ttl_seconds=31536000,
+                )
+                self.gitee_credential_handle = gitee_handle.handle_id
+                self.credential_scopes["gitee"].add(gitee_handle.handle_id)
+        except (SecretStoreUnavailable, TypeError, ValueError):
+            pass
         self.workflow = WorkflowEngine(
             self.store,
             self.db_mirror,
@@ -319,7 +342,7 @@ async def lifespan(app: FastAPI):
                     except Exception:
                         runtime.mcp_startup_errors[server_name] = "mcp_startup_failed"
 
-                await asyncio.gather(*(start_one(name) for name in ("boss", "github")))
+                await asyncio.gather(*(start_one(name) for name in ("boss", "gitee")))
 
             # Do not make the API's first response wait for optional browser/model
             # dependencies.  The manager still belongs to the lifespan and every
@@ -401,6 +424,8 @@ _SECRET_SETTING_KEYS = {
     "authorization",
     "bearer",
     "github_token",
+    "gitee_token",
+    "gitee_access_token",
     "password",
     "secret",
     "token",
@@ -705,7 +730,7 @@ async def environment(_: None = Depends(require_internal_token)) -> dict[str, An
 
 @app.post("/api/environment/{component}/recheck")
 async def environment_recheck(component: str, _: None = Depends(require_internal_token)) -> dict[str, Any]:
-    if component not in {"ollama", "database", "models", "mcp", "boss", "github"}:
+    if component not in {"ollama", "database", "models", "mcp", "boss", "gitee"}:
         raise HTTPException(status_code=404, detail="unknown component")
     if component == "database":
         app_state = state()
@@ -719,8 +744,8 @@ async def environment_recheck(component: str, _: None = Depends(require_internal
         if app_state.db_mirror.healthcheck():
             return {"component": component, "status": "ready", "configured_url": app_state.settings.public_dict().get("database_url")}
         return {"component": component, "status": "unavailable", "error_code": "database_unavailable"}
-    if component in {"mcp", "boss", "github"}:
-        names = ["boss", "github"] if component == "mcp" else [component]
+    if component in {"mcp", "boss", "gitee"}:
+        names = ["boss", "gitee"] if component == "mcp" else [component]
         results: dict[str, Any] = {}
         for name in names:
             try:
@@ -761,6 +786,8 @@ async def get_settings_api(_: None = Depends(require_internal_token)) -> dict[st
     values = dict(state().store.settings)
     values.pop("api_key", None)
     values.pop("github_token", None)
+    values.pop("gitee_token", None)
+    values.pop("gitee_access_token", None)
     configured: dict[str, bool] = {}
     for group, handles in state().credential_scopes.items():
         live = {handle for handle in handles if state().credentials.has(handle)}
@@ -978,18 +1005,26 @@ async def probe_model(profile_id: str, payload: dict[str, Any] | None = Body(def
 
 @app.post("/api/credentials/session")
 async def create_credential_session(payload: dict[str, Any], _: None = Depends(require_internal_token)) -> dict[str, Any]:
-    secret = payload.get("api_key") or payload.get("github_token")
+    secret = (
+        payload.get("api_key")
+        or payload.get("gitee_access_token")
+        or payload.get("github_token")  # legacy clients; not used by template flow
+        or payload.get("secret")
+    )
     profile_id = str(payload.get("profile_id") or "").strip()
     scope_value = payload.get("scope")
     if not scope_value and profile_id:
-        scope_value = f"model:{profile_id}"
+        scope_value = "gitee" if profile_id == GITEE_CREDENTIAL_ID else f"model:{profile_id}"
     scope = str(scope_value or "")
-    if profile_id and scope != f"model:{profile_id}":
+    expected_scope = (
+        "gitee" if profile_id == GITEE_CREDENTIAL_ID else f"model:{profile_id}"
+    )
+    if profile_id and scope != expected_scope:
         raise HTTPException(
             status_code=422,
             detail={
                 "error_code": "credential_scope_mismatch",
-                "message": "模型凭据 scope 与 profile_id 不匹配",
+                "message": "凭据 scope 与 profile_id 不匹配",
             },
         )
     if not secret and profile_id:
@@ -1014,9 +1049,9 @@ async def create_credential_session(payload: dict[str, Any], _: None = Depends(r
         ) from exc
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    scope_group = "github" if "github" in scope.lower() else "model"
+    scope_group = "gitee" if scope == "gitee" else ("github" if "github" in scope.lower() else "model")
     state().credential_scopes.setdefault(scope_group, set()).add(handle.handle_id)
-    if profile_id:
+    if profile_id and scope.startswith("model:"):
         registry = getattr(state(), "model_credential_handles", None)
         lock = getattr(state(), "credential_registry_lock", None)
 
@@ -1034,6 +1069,12 @@ async def create_credential_session(payload: dict[str, Any], _: None = Depends(r
         else:
             with lock:
                 register_handle()
+    elif profile_id == GITEE_CREDENTIAL_ID and scope == "gitee":
+        previous = getattr(state(), "gitee_credential_handle", None)
+        state().gitee_credential_handle = handle.handle_id
+        if previous and previous != handle.handle_id:
+            state().credentials.revoke(previous)
+            state().credential_scopes.setdefault("gitee", set()).discard(previous)
     return {"credential_handle_id": handle.handle_id, "scope": handle.scope, "expires_at": handle.expires_at_iso}
 
 
@@ -1075,6 +1116,13 @@ async def delete_stored_credential(
             status_code=409,
             detail={"error_code": "credential_store_unavailable", "message": str(exc)},
         ) from exc
+    if profile_id == GITEE_CREDENTIAL_ID:
+        handle_id = getattr(state(), "gitee_credential_handle", None)
+        if handle_id:
+            state().credentials.revoke(handle_id)
+            state().credential_scopes.setdefault("gitee", set()).discard(handle_id)
+        state().gitee_credential_handle = None
+        return {"removed": removed}
     registry = getattr(state(), "model_credential_handles", None)
     lock = getattr(state(), "credential_registry_lock", None)
 
@@ -1099,6 +1147,8 @@ async def delete_credential_session(handle_id: str, _: None = Depends(require_in
     revoked = state().credentials.revoke(handle_id)
     for handles in state().credential_scopes.values():
         handles.discard(handle_id)
+    if getattr(state(), "gitee_credential_handle", None) == handle_id:
+        state().gitee_credential_handle = None
     registry = getattr(state(), "model_credential_handles", None)
     lock = getattr(state(), "credential_registry_lock", None)
 
@@ -1124,9 +1174,9 @@ async def set_consent(
 ) -> dict[str, Any]:
     """Record a user decision for an external/risk-gated operation.
 
-    Consent is non-secret audit state and survives restart. Model API keys use
-    the separate machine-local encrypted store; GitHub tokens remain
-    process-local. Neither credential type enters this persistence path.
+    Consent is non-secret audit state and survives restart. Model API keys and
+    the Gitee template token use the separate machine-local encrypted store.
+    Neither credential type enters this persistence path.
     """
     aliases = {
         "external-model": "external_model",
@@ -4366,17 +4416,38 @@ def _resolve_cached_template_source(template_id: str) -> Path:
     return candidates[0]
 
 
-def _github_token(payload: dict[str, Any]) -> str | None:
-    handle_id = payload.get("credential_handle_id")
-    if not handle_id:
+def _gitee_token(payload: dict[str, Any]) -> str | None:
+    """Resolve a Gitee token from a live handle or the encrypted local store."""
+
+    app_state = state()
+    requested_handle = str(payload.get("credential_handle_id") or "").strip()
+    candidates = [requested_handle, str(getattr(app_state, "gitee_credential_handle", "") or "")]
+    for handle_id in candidates:
+        if not handle_id:
+            continue
+        try:
+            token = app_state.credentials.get(handle_id, scope="gitee")
+        except Exception:
+            continue
+        app_state.gitee_credential_handle = handle_id
+        app_state.credential_scopes.setdefault("gitee", set()).add(handle_id)
+        return token
+    secret_store = getattr(app_state, "secret_store", None)
+    if secret_store is None:
         return None
     try:
-        return state().credentials.get(str(handle_id), scope="github")
-    except Exception as exc:
+        token = secret_store.get(GITEE_CREDENTIAL_ID)
+    except SecretStoreUnavailable as exc:
         raise HTTPException(
-            status_code=401,
-            detail={"error_code": "credential_missing", "message": "GitHub 凭据句柄无效或已过期"},
+            status_code=409,
+            detail={"error_code": "credential_store_unavailable", "message": str(exc)},
         ) from exc
+    if not token:
+        return None
+    handle = app_state.credentials.put(token, scope="gitee", ttl_seconds=31536000)
+    app_state.gitee_credential_handle = handle.handle_id
+    app_state.credential_scopes.setdefault("gitee", set()).add(handle.handle_id)
+    return token
 
 
 def _builtin_template_item() -> dict[str, Any]:
@@ -4405,7 +4476,7 @@ async def _attach_template_visual_preview(
     """Attach a browser-renderable preview for one already cached template.
 
     A DOCX preview is generated only for the currently selected template, not
-    for every search result.  This keeps GitHub discovery responsive and avoids
+    for every search result.  This keeps Gitee discovery responsive and avoids
     returning arbitrary local files: both source and generated PDF must remain
     under the configured template cache directory.
     """
@@ -4537,30 +4608,37 @@ async def _attach_template_visual_preview(
 @app.post("/api/templates/search")
 async def search_templates(payload: dict[str, Any] | None = Body(default=None), _: None = Depends(require_internal_token)) -> dict[str, Any]:
     body = payload or {}
-    query = str(body.get("query", "中文简历模板"))
-    source = str(body.get("source", "github")).lower()
+    query = "固定 Gitee 中文单页 DOCX 简历模板"
+    source = str(body.get("source", "gitee")).lower()
     items: list[dict[str, Any]] = []
     error_code: str | None = None
     result_source = "builtin_fallback"
-    if source == "github":
-        token = _github_token(body)
+    if source == "gitee":
+        token = _gitee_token(body)
+        if not token:
+            return {
+                "status": "ready",
+                "source": "builtin_fallback",
+                "query": query,
+                "repository": GITEE_REPOSITORY,
+                "template_path": GITEE_TEMPLATE_PATH,
+                "items": [_builtin_template_item()],
+                "error_code": "credential_missing",
+                "message": "请先在环境与配置的“额外其他配置”中保存 Gitee 授权码",
+            }
         page = max(1, int(body.get("page", 1) or 1))
-        per_page = min(5, max(1, int(body.get("per_page", 5) or 5)))
-        health = await _ensure_mcp_server("github")
+        per_page = min(50, max(1, int(body.get("per_page", 5) or 5)))
+        health = await _ensure_mcp_server("gitee")
         if health.get("status") == "ready":
             arguments: dict[str, Any] = {
-                "query": query,
-                "language": "zh",
                 "page": page,
                 "per_page": per_page,
             }
-            if body.get("file_type"):
-                arguments["file_type"] = str(body["file_type"])
             if token:
-                arguments["github_token"] = token
+                arguments["gitee_access_token"] = token
             try:
                 remote_result = await state().mcp_manager.call_tool(
-                    "github", "github_search_resume_templates", arguments
+                    "gitee", "gitee_list_resume_templates", arguments
                 )
             except MCPClientError as exc:
                 error_code = exc.error_code
@@ -4569,11 +4647,11 @@ async def search_templates(payload: dict[str, Any] | None = Body(default=None), 
                     items = [
                         item
                         for item in remote_result["data"].get("items", [])
-                        if isinstance(item, dict) and item.get("license_allowed") is True
+                        if isinstance(item, dict) and item.get("file_type") == "docx"
                     ]
-                    result_source = "github_mcp"
+                    result_source = "gitee_mcp"
                 else:
-                    error_code = str(remote_result.get("error_code") or "github_unavailable")
+                    error_code = str(remote_result.get("error_code") or "gitee_unavailable")
         else:
             error_code = str(health.get("error_code") or "mcp_unavailable")
 
@@ -4581,17 +4659,14 @@ async def search_templates(payload: dict[str, Any] | None = Body(default=None), 
         if not items and error_code:
             try:
                 direct = await asyncio.to_thread(
-                    search_github_templates,
-                    query=query,
-                    language="zh",
-                    file_type=str(body.get("file_type") or "") or None,
+                    list_gitee_templates,
                     page=page,
                     per_page=per_page,
                     token=token,
                 )
-                items = [item for item in direct.get("items", []) if item.get("license_allowed") is True]
+                items = [item for item in direct.get("items", []) if item.get("file_type") == "docx"]
                 if items:
-                    result_source = "github_direct_fallback"
+                    result_source = "gitee_direct_fallback"
             except Exception:
                 pass
     if not items:
@@ -4602,8 +4677,55 @@ async def search_templates(payload: dict[str, Any] | None = Body(default=None), 
         "query": query,
         "items": items[:5],
         "error_code": error_code if result_source == "builtin_fallback" else None,
-        "message": "GitHub 模板服务不可用，已使用内置模板" if result_source == "builtin_fallback" and error_code else None,
+        "repository": GITEE_REPOSITORY,
+        "template_path": GITEE_TEMPLATE_PATH,
+        "message": "Gitee 模板服务不可用，已使用内置模板" if result_source == "builtin_fallback" and error_code else None,
     }
+
+
+@app.post("/api/templates/gitee/probe")
+async def probe_gitee_template_source(
+    payload: dict[str, Any] | None = Body(default=None),
+    _: None = Depends(require_internal_token),
+) -> dict[str, Any]:
+    """Probe the fixed Gitee directory through the standard FastMCP tool."""
+
+    body = payload or {}
+    token = _gitee_token(body)
+    if not token:
+        return {
+            "status": "needs_credentials",
+            "error_code": "credential_missing",
+            "message": "请先填写并保存 Gitee 授权码",
+            "repository": GITEE_REPOSITORY,
+            "template_path": GITEE_TEMPLATE_PATH,
+        }
+    health = await _ensure_mcp_server("gitee")
+    if health.get("status") == "ready":
+        try:
+            result = await state().mcp_manager.call_tool(
+                "gitee",
+                "gitee_probe_access",
+                {"gitee_access_token": token},
+            )
+        except MCPClientError as exc:
+            result = {"ok": False, "error_code": exc.error_code}
+        if result.get("ok") and isinstance(result.get("data"), dict):
+            return {**dict(result["data"]), "source": "gitee_mcp"}
+        error_code = str(result.get("error_code") or "gitee_unavailable")
+    else:
+        error_code = str(health.get("error_code") or "mcp_unavailable")
+    try:
+        direct = await asyncio.to_thread(probe_gitee_access, token=token)
+    except Exception:
+        return {
+            "status": "unavailable",
+            "error_code": error_code,
+            "message": "无法连接固定 Gitee 模板目录，请检查授权码和网络",
+            "repository": GITEE_REPOSITORY,
+            "template_path": GITEE_TEMPLATE_PATH,
+        }
+    return {**direct, "source": "gitee_direct_fallback", "mcp_error_code": error_code}
 
 
 @app.post("/api/templates/{template_id}/preview")
@@ -4631,17 +4753,22 @@ async def preview_template(
             requested=bool((payload or {}).get("render_visual", False)),
         )
     body = payload or {}
-    token = _github_token(body)
-    health = await _ensure_mcp_server("github")
+    token = _gitee_token(body)
+    if body.get("file_path") and not token:
+        raise HTTPException(
+            status_code=401,
+            detail={"error_code": "credential_missing", "message": "请先保存 Gitee 授权码"},
+        )
+    health = await _ensure_mcp_server("gitee")
     if health.get("status") == "ready":
         arguments: dict[str, Any] = {"template_id": template_id}
-        if body.get("source_url"):
-            arguments = {"source_url": str(body["source_url"])}
+        if body.get("file_path"):
+            arguments["file_path"] = str(body["file_path"])
         if token:
-            arguments["github_token"] = token
+            arguments["gitee_access_token"] = token
         try:
             remote = await state().mcp_manager.call_tool(
-                "github", "github_preview_template", arguments
+                "gitee", "gitee_preview_template", arguments
             )
         except MCPClientError:
             remote = {"ok": False, "error_code": "mcp_unavailable"}
@@ -4649,7 +4776,7 @@ async def preview_template(
             result = {
                 "template_id": template_id,
                 **dict(remote["data"]),
-                "source": "github_mcp",
+                "source": "gitee_mcp",
             }
             return await _attach_template_visual_preview(
                 result,
@@ -4657,9 +4784,11 @@ async def preview_template(
             )
 
     try:
-        if body.get("source_url"):
+        if body.get("file_path"):
             direct = await asyncio.to_thread(
-                preview_github_template, str(body["source_url"]), token=token
+                preview_gitee_template,
+                file_path=str(body["file_path"]),
+                token=token,
             )
         else:
             cache_root = (state().settings.data_root / "templates" / "cache").resolve()
@@ -4673,7 +4802,7 @@ async def preview_template(
             if not candidates:
                 raise FileNotFoundError("模板缓存文件不存在")
             direct = preview_cached_template(candidates[0], cache_root=cache_root)
-    except (ValueError, OSError) as exc:
+    except (GiteeAPIError, ValueError, OSError) as exc:
         raise HTTPException(
             status_code=404,
             detail={"error_code": "template_preview_unavailable", "message": str(exc)},
@@ -4836,31 +4965,33 @@ async def download_template(template_id: str, payload: dict[str, Any] | None = B
         _persist_template_result(result)
         return result
     body = payload or {}
-    source_url = str(body.get("source_url") or "")
-    if not source_url:
-        raise HTTPException(status_code=422, detail={"error_code": "template_source_required", "message": "远程模板需要 source_url"})
-    token = _github_token(body)
+    file_path = str(body.get("file_path") or "").strip()
+    if not file_path:
+        raise HTTPException(status_code=422, detail={"error_code": "template_path_required", "message": "Gitee 远程模板需要 file_path"})
+    token = _gitee_token(body)
+    if not token:
+        raise HTTPException(
+            status_code=401,
+            detail={"error_code": "credential_missing", "message": "请先保存 Gitee 授权码"},
+        )
     arguments = {
-        "source_url": source_url,
-        "repository": str(body.get("repository") or "") or None,
-        "file_path": str(body.get("file_path") or "") or None,
-        "filename": str(body.get("filename") or "") or None,
+        "file_path": file_path,
         "remote_version": str(body.get("remote_version") or "") or None,
         "confirm_update": bool(body.get("confirm_update", False)),
     }
     arguments = {key: value for key, value in arguments.items() if value is not None}
     if token:
-        arguments["github_token"] = token
-    health = await _ensure_mcp_server("github")
+        arguments["gitee_access_token"] = token
+    health = await _ensure_mcp_server("gitee")
     if health.get("status") == "ready":
         try:
             remote = await state().mcp_manager.call_tool(
-                "github", "github_download_template", arguments
+                "gitee", "gitee_download_template", arguments
             )
         except MCPClientError:
             remote = {"ok": False, "error_code": "mcp_unavailable"}
         if remote.get("ok") and isinstance(remote.get("data"), dict):
-            result = {**dict(remote["data"]), "source": "github_mcp"}
+            result = {**dict(remote["data"]), "source": "gitee_mcp"}
             _persist_template_result(result)
             return result
         if remote.get("requires_user"):
@@ -4868,22 +4999,19 @@ async def download_template(template_id: str, payload: dict[str, Any] | None = B
                 status_code=409,
                 detail={
                     "error_code": remote.get("error_code") or "template_download_failed",
-                    "message": "模板下载需要用户处理 GitHub 凭据或更新确认",
+                    "message": "模板下载需要用户处理 Gitee 凭据或更新确认",
                 },
             )
     try:
         result = await asyncio.to_thread(
-            cache_github_template,
-            source_url=source_url,
+            cache_gitee_template,
+            file_path=file_path,
             cache_root=state().settings.data_root / "templates" / "cache",
             token=token,
-            repository=str(body.get("repository") or "") or None,
-            file_path=str(body.get("file_path") or "") or None,
-            remote_version=str(body.get("remote_version") or "") or None,
-            filename=str(body.get("filename") or "") or None,
+            expected_remote_version=str(body.get("remote_version") or "") or None,
             allow_overwrite=bool(body.get("confirm_update", False)),
         )
-    except (ValueError, OSError) as exc:
+    except (GiteeAPIError, ValueError, OSError) as exc:
         raise HTTPException(status_code=422, detail={"error_code": "template_download_failed", "message": str(exc)}) from exc
     response = {"status": "cached", **result, "source": "local_fallback"}
     _persist_template_result(response)
@@ -4906,28 +5034,33 @@ async def check_template_update(
     if template_id == "builtin-cn-single-page":
         return {"template_id": template_id, "status": "up_to_date", "auto_overwrite": False}
     body = payload or {}
-    token = _github_token(body)
-    health = await _ensure_mcp_server("github")
+    token = _gitee_token(body)
+    if not token:
+        raise HTTPException(
+            status_code=401,
+            detail={"error_code": "credential_missing", "message": "请先保存 Gitee 授权码"},
+        )
+    health = await _ensure_mcp_server("gitee")
     if health.get("status") == "ready":
         arguments: dict[str, Any] = {"template_id": template_id}
         if token:
-            arguments["github_token"] = token
+            arguments["gitee_access_token"] = token
         try:
             remote = await state().mcp_manager.call_tool(
-                "github", "github_check_template_update", arguments
+                "gitee", "gitee_check_template_update", arguments
             )
         except MCPClientError:
             remote = {"ok": False}
         if isinstance(remote.get("data"), dict):
-            return {**dict(remote["data"]), "source": "github_mcp"}
+            return {**dict(remote["data"]), "source": "gitee_mcp"}
     try:
         direct = await asyncio.to_thread(
-            check_github_template_update,
+            check_gitee_template_update,
             cache_root=state().settings.data_root / "templates" / "cache",
             template_id=template_id,
             token=token,
         )
-    except (ValueError, OSError) as exc:
+    except (GiteeAPIError, ValueError, OSError) as exc:
         raise HTTPException(
             status_code=422,
             detail={"error_code": "template_update_check_failed", "message": str(exc)},

@@ -25,7 +25,7 @@ Resume Agent 面向“一岗一简历”场景：通过独立 Microsoft Edge 采
 
 - Streamlit 问答向导，按选择逐步显示后续操作。
 - FastAPI 后端，LangChain + LangGraph 智能体与持久化 `thread_id`。
-- 基于 FastMCP、`stdio` 的标准 BOSS/GitHub MCP 工具。
+- 基于 FastMCP、`stdio` 的标准 BOSS/Gitee MCP 工具。
 - 云端聊天与 Embedding 模型独立配置；Ollama 动态扫描本机真实模型。
 - 云端 API Key 仅在本机加密保存，不写入 PostgreSQL、日志或 Git。
 - 上传一份 DOCX、Markdown、TXT 或可复制文本 PDF（最大 10 MB，PDF 最多 3 页）。
@@ -178,13 +178,15 @@ PostgreSQL 是持久化工作流数据库，不负责运行模型，也不直接
 | `RESUME_AGENT_INTERNAL_TOKEN` | 留空 | 留空时自动生成到被忽略的 `data/.internal-token` |
 | `RESUME_AGENT_EDGE_PATH` | 留空自动检测 | 必要时填写 `msedge.exe` 的绝对路径 |
 | `RESUME_AGENT_OLLAMA_BASE_URL` | `http://127.0.0.1:11434` | 本地 Ollama 地址 |
-| `RESUME_AGENT_MCP_AUTOSTART` | `true` | 由 FastAPI 自动管理 BOSS/GitHub MCP 子进程 |
+| `RESUME_AGENT_MCP_AUTOSTART` | `true` | 由 FastAPI 自动管理 BOSS/Gitee MCP 子进程 |
 
-不要把云端 API Key 或 GitHub Token 写入 `.env`。聊天/Embedding Key 请在网页环境页填写并保存在本机加密凭据库；GitHub Token 仅在需要模板检索时临时输入。
+不要把云端 API Key 或 Gitee 授权码写入 `.env`。聊天/Embedding Key 与 Gitee 授权码均在网页环境页填写，使用本机密钥加密保存并在后续启动时自动复用。
 
 Compose 已将 PostgreSQL 仅绑定到 `127.0.0.1`，不会直接暴露到局域网。若不再是单机可信开发环境，请先修改示例数据库密码；密码包含特殊字符时，写入 `RESUME_AGENT_DATABASE_URL` 前需要进行 URL 编码。
 
 ## 模型配置
+
+网页第一栏重新分为三个一级区块：**浏览器配置**、**大模型配置**和**额外其他配置**。Edge 位于浏览器配置；云端聊天、云端 Embedding 与本地 Ollama 位于大模型配置；Gitee 授权码位于额外其他配置。
 
 ### 云端 OpenAI-compatible
 
@@ -207,6 +209,12 @@ ollama list
 ```
 
 必要时运行 `ollama serve`。网页会读取 Ollama 实际安装的全部模型，并分别筛选聊天与 Embedding 能力；系统不会静默下载模型。
+
+### Gitee 模板授权
+
+模板来源固定为 [`hicv-cn/hicv-word-resume-templates-jianyue-single`](https://gitee.com/hicv-cn/hicv-word-resume-templates-jianyue-single) 的 `main` 分支，只读取 `templates/02_简约简历/单页` 目录中的直接子文件，并且只接受 `.docx`。在“额外其他配置”中填写 Gitee 私人令牌，点击“保存并检测 Gitee”。授权码以密码框输入，使用本机 AES-GCM 凭据库加密保存，重启后自动复用；不会写入 `.env`、PostgreSQL、MCP 子进程环境变量、日志、模板元数据或 Git。
+
+Gitee FastMCP 工具不接受仓库、分支或根目录覆盖参数，因此调用方不能借模板接口读取固定目录之外的内容。
 
 ## 截图 OCR
 
@@ -234,7 +242,7 @@ uv run python -c "from paddleocr import PaddleOCR; PaddleOCR(text_detection_mode
 - 每个任务只允许一份主简历。
 - PDF 必须包含可复制文本，最大 10 MB、最多 3 页。
 - 上传简历和选中的模板都必须经过模型结构化拆解，并由用户可编辑确认。
-- GitHub 模板限定为许可明确的中文简历文件；系统尝试提供至少 5 个高 Star/高相关候选，失败时回退内置模板。
+- 模板选择器从固定 Gitee 单页目录读取最多 5 个 DOCX，逐个下载并生成视觉预览；Gitee 不可用时回退内置模板。
 - 模型合理推导的技术方案和职责均标记 `[待核实]`，正式写入前逐字段确认。
 - 修改使用字段级补丁，应用前校验 checkpoint 版本和旧值哈希。
 - 超过一页时优先压缩字体、行距和页边距；缩短正文必须再次征得用户同意。
@@ -263,7 +271,7 @@ git diff --cached --check
 git diff --cached
 ```
 
-不要提交真实简历、API Key、GitHub Token、浏览器资料、Cookie、数据库或生成产物。云端模型 Key 通过网页输入并仅在本机加密保存；GitHub Token 只在当前进程内使用，不持久化。
+不要提交真实简历、API Key、Gitee 授权码、浏览器资料、Cookie、数据库或生成产物。云端模型 Key 与 Gitee 授权码均通过网页输入并仅在本机加密保存。
 
 ## 测试
 
@@ -283,9 +291,9 @@ uv run python -m ruff check --select E9,F63,F7,F82 app tests
 
 保持项目采集 Edge 运行。网页会自动再执行一次后台懒加载，并在没有明确结束标记时保留游标。若 BOSS 要求登录或验证，请人工完成后重新提交搜索。
 
-### GitHub 模板下载超时
+### Gitee 模板列取或下载超时
 
-检查 DNS、防火墙、系统代理以及 `github.com`、`raw.githubusercontent.com`。临时 GitHub Token 可降低限流概率，但不会保存；网络不可用时可使用内置模板。
+检查 DNS、防火墙、系统代理和 `gitee.com`，然后在“额外其他配置”中重新保存并检测 Gitee 授权码。固定远程目录不可用时仍可使用内置模板。
 
 ## 目录结构
 

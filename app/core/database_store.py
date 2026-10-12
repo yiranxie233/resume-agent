@@ -108,6 +108,8 @@ def _validated_profile_url(value: Any) -> str:
         "access_token",
         "client_secret",
         "github_token",
+        "gitee_token",
+        "gitee_access_token",
         "key",
         "password",
         "secret",

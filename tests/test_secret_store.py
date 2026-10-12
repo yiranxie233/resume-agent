@@ -11,6 +11,7 @@ from unittest.mock import patch
 from app.core.model_gateway import CredentialStore
 from app.core.secret_store import EncryptedSecretStore
 from app.main import (
+    GITEE_CREDENTIAL_ID,
     _materialize_model_credential,
     create_credential_session,
     delete_stored_credential,
@@ -126,6 +127,49 @@ class EncryptedSecretStoreTests(unittest.TestCase):
 
 
 class StoredCredentialApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_gitee_token_is_encrypted_and_reusable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "credentials" / "model-secrets.json"
+
+            def transform(value: bytes) -> bytes:
+                return bytes(item ^ 0xA5 for item in value)
+
+            app_state = SimpleNamespace(
+                secret_store=EncryptedSecretStore(path, protect=transform, unprotect=transform),
+                credentials=CredentialStore(),
+                credential_scopes={"model": set(), "gitee": set()},
+                model_credential_handles={},
+                gitee_credential_handle=None,
+                credential_registry_lock=threading.RLock(),
+            )
+            with patch("app.main.state", return_value=app_state):
+                saved = await create_credential_session(
+                    {
+                        "profile_id": GITEE_CREDENTIAL_ID,
+                        "scope": "gitee",
+                        "gitee_access_token": "gitee-private-value",
+                        "persist": True,
+                        "ttl_seconds": 300,
+                    },
+                    None,
+                )
+                restored = await create_credential_session(
+                    {
+                        "profile_id": GITEE_CREDENTIAL_ID,
+                        "scope": "gitee",
+                        "persist": False,
+                        "ttl_seconds": 300,
+                    },
+                    None,
+                )
+
+            self.assertNotIn("gitee-private-value", path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                app_state.credentials.get(restored["credential_handle_id"], scope="gitee"),
+                "gitee-private-value",
+            )
+            self.assertFalse(app_state.credentials.has(saved["credential_handle_id"]))
+
     async def test_status_requires_ciphertext_to_be_decryptable(self) -> None:
         broken_store = SimpleNamespace(
             has=lambda profile_id: True,

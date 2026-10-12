@@ -44,7 +44,7 @@ Resume Agent 用于减少 BOSS 直聘场景中“一岗一简历”的制作成�
 - 中文 `.docx` 和文本型 PDF 简历导入；PDF 不做 OCR。
 - 现有简历的项目经历处理，以及按需逐项优化个人简介、技能清单、个人评价。
 - 无现有简历时基于真实基础信息和目标 JD 制作一页中文简历。
-- GitHub 中文模板检索、预览、缓存和迁移。
+- 固定 Gitee 中文单页 DOCX 模板列取、预览、缓存和迁移。
 - OpenAI 兼容接口与 Ollama 模型选择、检测和结构化输出降级。
 - 匹配评分、候选项目、多轮反馈、事实确认、版本回退和 DOCX/PDF 导出。
 
@@ -83,7 +83,7 @@ Resume Agent 用于减少 BOSS 直聘场景中“一岗一简历”的制作成�
        └────── visible Microsoft Edge with isolated profile
 
 ┌──────────────────────┐       ┌──────────────────────────────┐
-│ GitHub Template MCP  │       │ Model Gateway                 │
+│ Gitee Template MCP  │       │ Model Gateway                 │
 │ Python / stdio       │       │ OpenAI-compatible / Ollama    │
 └──────────────────────┘       └──────────────────────────────┘
 
@@ -98,7 +98,7 @@ LibreOffice fallback, encrypted model-key recovery plus scoped in-memory handles
 - FastAPI：业务 API、任务队列、图执行、文件和数据库协调。
 - Streamlit：轻量 UI，只通过 FastAPI 调用业务，不直接写数据库。
 - Edge helper：独立进程，启动可见 Edge，使用独立 profile；只监听 `127.0.0.1`。
-- BOSS MCP、GitHub MCP：使用官方 MCP SDK 的 `mcp.server.fastmcp.FastMCP` 注册工具并以 `stdio` 运行，由主应用管理生命周期。
+- BOSS MCP、Gitee MCP：使用官方 MCP SDK 的 `mcp.server.fastmcp.FastMCP` 注册工具并以 `stdio` 运行，由主应用管理生命周期。
 - Word/LibreOffice：宿主机安装的渲染和转换引擎。
 - Ollama：宿主机可选服务，启动时探测，不由应用自动安装。
 - PostgreSQL：固定版本官方镜像、Docker volume、本地配置初始化。
@@ -121,7 +121,7 @@ LibreOffice fallback, encrypted model-key recovery plus scoped in-memory handles
 
 必需：Windows、Python、Docker Desktop、Microsoft Edge、Docker 可运行的 PostgreSQL。
 
-按功能可选：Microsoft Word 或 LibreOffice、Ollama、GitHub Token、外部 OpenAI 兼容接口。岗位截图功能需要 PaddleOCR 3.7、PaddlePaddle 3.3、Pillow 和已经下载到本机的 `PP-OCRv6_medium_det`/`PP-OCRv6_medium_rec`。
+按功能可选：Microsoft Word 或 LibreOffice、Ollama、Gitee 授权码、外部 OpenAI 兼容接口。岗位截图功能需要 PaddleOCR 3.7、PaddlePaddle 3.3、Pillow 和已经下载到本机的 `PP-OCRv6_medium_det`/`PP-OCRv6_medium_rec`。
 
 ### 5.2 启动流程
 
@@ -133,7 +133,7 @@ LibreOffice fallback, encrypted model-key recovery plus scoped in-memory handles
 6. 先扫描并处理遗留 `pending` 节点操作；无法判定的任务冻结并显示恢复冲突。
 7. 仅恢复 PostgreSQL 中状态为 `running`、`waiting_user` 或 `paused` 且没有未处理操作的任务，标记需要用户选择继续或重试。恢复外部模型任务前从本机加密凭据仓库重新生成有作用域的内存 handle，并检查模型探测状态；凭据无法解密或不存在时保持 `status=paused, blocked_reason=needs_credentials`，本地模型被卸载或能力探测过期时保持 `status=paused, blocked_reason=needs_model_recheck`，不能静默换模型。
 
-Docker 未安装、数据库无法连接或 Edge 环境缺失时，只阻止依赖它们的功能，并在环境页给出修复动作。Word/LibreOffice、Ollama、GitHub Token 检查失败可以跳过。
+Docker 未安装、数据库无法连接或 Edge 环境缺失时，只阻止依赖它们的功能，并在环境页给出修复动作。Word/LibreOffice、Ollama、Gitee 授权码检查失败可以跳过。
 
 ### 5.3 环境检查页面
 
@@ -144,7 +144,7 @@ Docker 未安装、数据库无法连接或 Edge 环境缺失时，只阻止依�
 - Word/LibreOffice 与默认渲染引擎
 - Ollama 服务，以及分别按聊天角色/embedding 角色列出的已下载模型、模型 tag/digest 和探测状态
 - OpenAI 兼容模型配置
-- GitHub Token 和模板缓存
+- Gitee 授权码和模板缓存
 - 数据目录读写权限
 
 Edge 支持自动检测 `msedge.exe` 路径，检测失败时允许手动指定；页面提供“打开 Edge 并登录 BOSS”“检测登录状态”“退出并清除会话”按钮。第一版只支持 BOSS 网页版，不支持移动端 URL。独立 profile 放在可配置数据目录下，Edge 窗口保持可见。
@@ -213,21 +213,21 @@ HR 活跃筛选默认不限，可选择“在线或刚刚活跃、今日活跃�
 - OCR 检测框按视觉行聚类后再按横坐标排序，避免同一行轻微纵向抖动导致文字倒序。聊天模型增强失败时必须返回 OCR 校正文字、规则解析职位和 `model_fallback=true`；UI 必须回到包含原截图、可编辑 OCR 文字、规则结构、“使用当前模型重试”和“接受规则结果继续”的确认阶段，不能直接进入模型成功后的操作；重试调用现有职位重新解析接口，不要求再次上传。
 - 岗位截图 OCR 与简历 PDF 边界独立：扫描版简历 PDF 仍拒绝，不能借岗位截图接口绕过简历输入约束。
 
-### 6.5 GitHub 模板 MCP 工具
+### 6.5 Gitee 模板 MCP 工具
 
-建议工具名和职责如下：
+模板来源固定为仓库 `hicv-cn/hicv-word-resume-templates-jianyue-single`、分支 `main`、目录 `templates/02_简约简历/单页`。仓库、分支和目录是后端常量，不能由 HTTP/MCP 调用参数覆盖；只列取该目录的直接子文件，只接受 `.docx`，跳过子目录与其他格式。工具名和职责如下：
 
 | 工具 | 输入 | 输出/副作用 |
 |---|---|---|
-| `github_search_resume_templates` | 关键词、语言、文件类型、页码 | 中文模板候选，按 Star 降序，默认 5 条 |
-| `github_get_template_license` | 仓库/文件 | 许可证、是否允许修改和本地使用 |
-| `github_preview_template` | 仓库/文件 | 统一页面或图片预览 |
-| `github_download_template` | 候选标识 | 本地缓存路径、版本和来源元数据 |
-| `github_check_template_update` | 本地模板记录 | 远程版本差异，不自动覆盖 |
+| `gitee_probe_access` | 仅本次调用的授权码 | 固定仓库、分支、目录的连通性和模板数量 |
+| `gitee_list_resume_templates` | 页码、每页数量、仅本次调用的授权码 | 固定目录中的 DOCX 候选，默认 5 条 |
+| `gitee_preview_template` | 固定目录文件路径或缓存模板 ID | 受限预览元数据 |
+| `gitee_download_template` | 固定目录文件路径、远程版本、覆盖确认 | 校验并缓存 DOCX，返回版本和来源元数据 |
+| `gitee_check_template_update` | 本地模板 ID | 远程版本差异，不自动覆盖 |
 
-只展示中文 `.docx` 或 Markdown 模板，许可证必须明确允许修改和本地使用；许可证不明、禁止修改或要求在简历成品中附带署名/版权声明的模板直接排除。卡片展示仓库链接、许可证、Star 数、最后更新时间和来源。GitHub Token 可选，仅在当前 GitHub MCP 请求的内存中使用；无 Token 使用匿名请求。Token 不写入配置、数据库、日志或备份。
+Gitee 授权码在环境页“额外其他配置”区以密码框输入，固定凭据 ID 为 `gitee-template-access-token`、内存 scope 为 `gitee`。授权码使用本机 AES-GCM 凭据库持久化，页面只显示掩码；后端启动时可恢复为长 TTL 内存 handle。明文只进入当前 HTTP/MCP 工具调用，不写入普通配置、PostgreSQL、子进程环境变量、模板元数据、日志、快照或备份。Gitee HTTP 错误必须转换为不含请求 URL 的安全异常，避免查询参数中的 `access_token` 泄漏。
 
-用户选中的模板复制到本地模板目录并保存版本信息。UI 显示“在 GitHub 查找、简历下载（x/x）、校验预览、完成”的阶段进度；失败信息至少区分凭据、限流、FastMCP 进程、DNS/连接/超时、许可证和模板文件问题，并提供修复建议及显式重试。检测到远程更新时只提示用户选择下载或继续当前版本。GitHub 不可用时使用已缓存模板；没有缓存时使用内置一页中文模板。
+用户选中的模板复制到本地模板目录并保存版本信息。UI 显示“连接 Gitee、读取固定模板目录、简历下载（x/x）、校验预览、完成”的阶段进度；失败信息至少区分凭据、限流、FastMCP 进程、DNS/连接/超时和模板文件问题，并提供修复建议及显式重试。检测到远程更新时只提示用户选择下载或继续当前版本。Gitee 不可用时使用已缓存模板；没有缓存时使用内置一页中文模板。模板视觉预览、大模型结构拆解、可编辑确认流程保持不变。
 
 ## 7. LangGraph 智能体设计
 
@@ -464,9 +464,9 @@ PDF 先解析并重建为可编辑 DOCX。若文字顺序或版式信息严重�
 
 ### 9.3 模板决策
 
-- 有原简历：询问保留原模板或选择 GitHub 模板，并分别展示预览。
-- 无原简历：先从 GitHub 中文模板选择，获取失败或用户不选择时使用内置模板。
-- 模板向导调用标准 GitHub MCP 搜索最多 5 个中文候选，逐个完成许可证校验、下载缓存和预览后再允许选择。Markdown 模板填充基础资料与项目区块；DOCX 模板保留原文件并替换受支持的 `{{name}}`、`{{resume_content}}` 等占位符，未提供完整内容占位符时必须在导出警告中说明降级行为。
+- 有原简历：询问保留原模板或选择固定 Gitee 目录中的模板，并分别展示预览。
+- 无原简历：先从固定 Gitee 中文单页 DOCX 目录选择，获取失败或用户不选择时使用内置模板。
+- 模板向导调用标准 Gitee MCP 列取最多 5 个候选，逐个完成下载缓存和预览后再允许选择。DOCX 模板保留原文件并替换受支持的 `{{name}}`、`{{resume_content}}` 等占位符，未提供完整内容占位符时必须在导出警告中说明降级行为。
 - 迁移到新模板后先生成完整预览，用户确认布局后才进入匹配和内容优化。
 - 映射或排版无法安全完成时暂停，保留原简历版本，让用户回到原模板或取消迁移。
 
@@ -651,7 +651,7 @@ JD 解析结果至少包含岗位目标、职责清单、任职要求、技能�
 | `job_evidence` | JD 段落、字段证据、来源定位、稳定 `evidence_id` 和文本哈希 |
 | `resume_files` | 原始/重建文件、格式、页数、哈希和任务引用 |
 | `resume_sections` | 结构化模块、段落 ID、页码、稳定 `evidence_id`、文本哈希和用户修正状态 |
-| `template_records` | GitHub 来源、许可证、Star、版本、缓存路径和更新状态 |
+| `template_records` | Gitee 固定来源、文件路径、版本、缓存路径和更新状态 |
 | `match_runs` | 权重、四维分数、总分、证据和模型版本 |
 | `scoring_configs` | 原子项提取/归一化/rubric 版本、两层权重、舍入规则和配置快照 |
 | `generated_versions` | 项目/模块草稿、正式版本、`generation_branch_id`、`candidate_slot_id` 和来源 |
@@ -669,7 +669,7 @@ JD 解析结果至少包含岗位目标、职责清单、任职要求、技能�
 | `export_runs` | 强制绑定 `snapshot_id`，并记录引擎、格式、页数、预览、反馈和合规状态 |
 | `backup_manifests` | 备份清单、校验值、创建时间和恢复记录 |
 
-模型 API Key 不保存到数据库、普通配置、日志、任务快照或备份。新保存值统一使用 AES-GCM 与单独生成的本机权限受限密钥，密文和密钥位于 `data/credentials/`；该目录禁止进入 Git 和备份。旧版 DPAPI 密文仅做兼容读取，无法解密时要求用户重新输入一次，禁止仅凭“密文记录存在”显示为已保存。写入后必须立即解密回读校验；服务启动或任务调用时从加密仓库重新生成带 TTL、按 profile 隔离的内存 handle，明文不进入队列。GitHub Token 仍只在当前进程内存中使用。凭据无法解密、被删除或 handle 失效且无法重建时，任务保持 `status=paused, blocked_reason=needs_credentials`。数据库只保存非敏感 profile 和 `credential_required=true`。
+模型 API Key 和 Gitee 授权码不保存到数据库、普通配置、日志、任务快照或备份。新保存值统一使用 AES-GCM 与单独生成的本机权限受限密钥，密文和密钥位于 `data/credentials/`；该目录禁止进入 Git 和备份。旧版 DPAPI 密文仅做兼容读取，无法解密时要求用户重新输入一次，禁止仅凭“密文记录存在”显示为已保存。写入后必须立即解密回读校验；服务启动或任务调用时从加密仓库重新生成带 TTL、按 scope/profile 隔离的内存 handle，明文不进入队列。凭据无法解密、被删除或 handle 失效且无法重建时，依赖功能返回 `needs_credentials`。数据库只保存非敏感 profile 和 `credential_required=true`。
 
 ## 14. 本地文件布局
 
@@ -775,15 +775,15 @@ POST /api/backups/validate
 POST /api/backups/restore
 ```
 
-`POST /api/credentials/session` 的请求体可以包含一个 profile 的模型 API Key 或 GitHub Token，但响应只返回不可逆的 `credential_handle_id`、作用域和过期时间；明文不进入响应、日志、SSE、checkpoint 或数据库。模型 API Key 默认同步写入本机加密仓库，GitHub Token 不持久化。创建外部模型任务时，聊天和 Embedding 分别携带自己的内存 handle；服务重启后旧 handle 失效，但后端可从加密仓库重新生成，只有重建失败时才按 `blocked_reason=needs_credentials` 暂停。
+`POST /api/credentials/session` 的请求体可以包含一个 profile 的模型 API Key 或固定凭据 ID `gitee-template-access-token` 的 Gitee 授权码，但响应只返回不可逆的 `credential_handle_id`、作用域和过期时间；明文不进入响应、日志、SSE、checkpoint 或数据库。两类凭据默认同步写入本机加密仓库。服务重启后旧 handle 失效，但后端可从加密仓库重新生成；只有重建失败时才返回 `needs_credentials`。
 
 ## 17. 安全、隐私与日志
 
 ### 17.1 凭据
 
-- 模型 API Key 与 GitHub Token 均为 write-only，界面不回显明文。模型 Key 可在本机加密保存；GitHub Token 只在当前进程内存中短暂使用。
-- 模型 Key 不写入普通配置、PostgreSQL、日志、快照或备份；加密密文和本机密钥位于被 Git/备份排除的 `data/credentials/`。聊天和 Embedding 凭据按 profile 隔离。
-- 恢复备份不会恢复凭据；本机原有加密仓库仍可用时自动重建 handle，否则依赖外部模型或 GitHub 的任务保持 `status=paused, blocked_reason=needs_credentials`。
+- 模型 API Key 与 Gitee 授权码均为 write-only，界面不回显明文，只显示掩码和可用状态；二者都可在本机加密保存。
+- 凭据不写入普通配置、PostgreSQL、日志、快照或备份；加密密文和本机密钥位于被 Git/备份排除的 `data/credentials/`。聊天和 Embedding 凭据按 profile 隔离，Gitee 使用独立 scope。
+- 恢复备份不会恢复凭据；本机原有加密仓库仍可用时自动重建 handle，否则依赖外部模型或 Gitee 的操作返回 `needs_credentials`。
 
 ### 17.2 外部模型同意
 
@@ -803,7 +803,7 @@ FastAPI、Streamlit、Edge helper 只监听 loopback；内部请求必须携带�
 
 ### 18.1 备份
 
-用户手动点击执行备份。备份包括 PostgreSQL 数据、任务目录、原始简历、JD 快照、导出文件、模板缓存、Skill 和版本记录；排除 `data/credentials/`、API Key、GitHub Token、Edge profile 和 BOSS 登录会话。备份不额外加密。
+用户手动点击执行备份。备份包括 PostgreSQL 数据、任务目录、原始简历、JD 快照、导出文件、模板缓存、Skill 和版本记录；排除 `data/credentials/`、API Key、Gitee 授权码、Edge profile 和 BOSS 登录会话。备份不额外加密。
 
 备份创建期间阻止新任务，并等待当前任务进入可保存状态，生成包含文件清单、版本信息和 SHA-256 校验值的归档。
 
@@ -826,7 +826,7 @@ FastAPI、Streamlit、Edge helper 只监听 loopback；内部请求必须携带�
 ### 阶段 1：环境与凭据
 
 - Edge/Word/LibreOffice/Ollama 检测。
-- 模型 API Key 本机加密存储、profile 作用域、内存 handle、TTL、清除和 `needs_credentials` 恢复门禁；GitHub Token 不持久化。
+- 模型 API Key 与 Gitee 授权码的本机加密存储、独立 scope、内存 handle、TTL、清除和 `needs_credentials` 恢复门禁。
 - 模型配置、能力探测、默认模型门禁。
 
 ### 阶段 2：MCP 与职位
@@ -835,7 +835,7 @@ FastAPI、Streamlit、Edge helper 只监听 loopback；内部请求必须携带�
 - Playwright Edge helper、登录状态和人工处理暂停。
 - BOSS 搜索/可靠分页/按需详情/快照/HR 活跃状态与访问风险确认；公司招聘官网网址入口仅预留。
 - 岗位截图粘贴/上传、PP-OCRv6 medium 识别、校正与确认 API。
-- GitHub 模板搜索、许可证过滤、预览和缓存。
+- 固定 Gitee 目录的 DOCX 模板列取、下载、预览、缓存和更新检测。
 
 ### 阶段 3：解析与匹配图
 
@@ -885,7 +885,7 @@ FastAPI、Streamlit、Edge helper 只监听 loopback；内部请求必须携带�
 
 ### 安全验收
 
-- 日志、备份、数据库和任务快照中不存在模型 API Key 明文、GitHub Token、Cookie 或完整登录会话；加密凭据目录不进入 Git/备份。
+- 日志、备份、数据库和任务快照中不存在模型 API Key 明文、Gitee 授权码、Cookie 或完整登录会话；加密凭据目录不进入 Git/备份。
 - 外部模型首次同意、撤销再确认和 HTTPS 校验生效。
 - 外部文本中的 prompt injection 不能改变系统策略。
 - Edge helper 和内部 API 未携带随机令牌时拒绝请求。

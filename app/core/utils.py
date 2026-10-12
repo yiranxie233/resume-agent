@@ -81,6 +81,8 @@ _SENSITIVE_KEYS = {
     "bearer",
     "client_secret",
     "github_token",
+    "gitee_token",
+    "gitee_access_token",
     "password",
     "secret",
     "token",
@@ -117,6 +119,7 @@ def redact_sensitive(value: Any) -> Any:
         value = re.sub(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+", r"\1[redacted]", value)
         value = re.sub(r"(?i)(api[_-]?key\s*[:=]\s*)[^\s,;]+", r"\1[redacted]", value)
         value = re.sub(r"(?i)(github[_-]?token\s*[:=]\s*)[^\s,;]+", r"\1[redacted]", value)
+        value = re.sub(r"(?i)(gitee[_-]?(?:access[_-]?)?token\s*[:=]\s*)[^\s,;]+", r"\1[redacted]", value)
         value = re.sub(r"(?i)((?:set-)?cookie\s*[:=]\s*)[^\r\n]+", r"\1[redacted]", value)
         value = re.sub(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b", "[redacted]", value)
         value = re.sub(r"\bsk-[A-Za-z0-9_-]{20,}\b", "[redacted]", value)

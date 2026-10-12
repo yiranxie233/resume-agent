@@ -1606,6 +1606,8 @@ _SENSITIVE_METADATA_KEYS = {
     "authorization",
     "bearer",
     "github_token",
+    "gitee_token",
+    "gitee_access_token",
     "password",
     "secret",
     "token",

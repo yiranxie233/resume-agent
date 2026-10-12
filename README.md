@@ -25,7 +25,7 @@ The application is designed around human confirmation. Model-inferred claims rem
 
 - Guided Streamlit workflow instead of a crowded multi-panel form.
 - FastAPI backend with LangChain + LangGraph orchestration and durable `thread_id` checkpoints.
-- Standard MCP servers implemented with FastMCP over `stdio` for BOSS collection and GitHub template discovery.
+- Standard MCP servers implemented with FastMCP over `stdio` for BOSS collection and fixed-source Gitee template access.
 - OpenAI-compatible cloud chat/embedding profiles and dynamically discovered Ollama models.
 - Encrypted, machine-local cloud API-key persistence; secrets are never written to PostgreSQL or Git.
 - Upload one DOCX, Markdown, TXT, or text-based PDF (up to 10 MB and 3 PDF pages).
@@ -150,7 +150,7 @@ For a lightweight trial, omit `RESUME_AGENT_DATABASE_URL` and run `uv run python
 uv run python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
-FastAPI owns both FastMCP `stdio` processes. Do not launch the BOSS or GitHub MCP server separately.
+FastAPI owns both FastMCP `stdio` processes. Do not launch the BOSS or Gitee MCP server separately.
 
 ### 4. Start the web UI
 
@@ -195,7 +195,7 @@ Uploaded resumes, OCR images, generated artifacts, the authenticated Edge profil
 
 ## Model Setup
 
-Configure models in the first page of the UI.
+The first page is grouped into **Browser configuration**, **Model configuration**, and **Additional configuration**. Configure Edge in the first group, cloud/Ollama chat and embedding models in the second, and the Gitee template token in the third.
 
 ### OpenAI-compatible providers
 
@@ -218,6 +218,12 @@ ollama list
 ```
 
 Start `ollama serve` if the service is not already running. The UI reads the live Ollama model list and lets you select real installed chat and embedding models independently. It never silently downloads a model.
+
+### Gitee template access
+
+The template source is fixed to [`hicv-cn/hicv-word-resume-templates-jianyue-single`](https://gitee.com/hicv-cn/hicv-word-resume-templates-jianyue-single), branch `main`, directory `templates/02_简约简历/单页`. In **Additional configuration**, enter a Gitee personal access token and click **Save and test Gitee**. The token is masked, encrypted in the machine-local credential store, and automatically reused after restart. It is never written to `.env`, PostgreSQL, MCP child-process environment variables, logs, template metadata, or Git.
+
+The FastMCP server exposes only this repository, branch, and directory. It ignores subdirectories and non-DOCX files; callers cannot override the source with request parameters.
 
 ## Screenshot OCR
 
@@ -245,7 +251,7 @@ Models are normally cached under `%USERPROFILE%\.paddlex\official_models`. The a
 - One primary resume per task.
 - Text-based PDFs only, up to 10 MB and 3 pages.
 - Uploaded resume and selected template structures must be model-parsed, edited if needed, and explicitly confirmed.
-- GitHub templates are restricted to Chinese resume files with an allowed license; the picker attempts to provide five high-star/relevant candidates and falls back to the built-in template when needed.
+- The template picker reads up to five DOCX files from the fixed Gitee single-page directory, downloads and visually previews them, and falls back to the built-in template when Gitee is unavailable.
 - Model-derived technical plans or claims stay marked `[待核实]` until the user confirms every required field.
 - Resume changes are field-level patches. The backend checks both checkpoint version and old-value hash before applying them.
 - If a resume exceeds one page, layout compression is proposed first; content rewriting requires separate user consent.
@@ -278,7 +284,7 @@ Copy the tracked placeholder file `.env.example` to the ignored machine-local `.
 | `RESUME_AGENT_TASK_TIMEOUT_SECONDS` | `300` | Default task timeout |
 | `RESUME_AGENT_LOG_RETENTION_DAYS` | `30` | Local log retention |
 
-Do not place cloud API keys or GitHub tokens in `.env`. Cloud model keys are entered in the UI and encrypted locally; GitHub tokens are session-only.
+Do not place cloud API keys or the Gitee access token in `.env`. Enter them in the UI; each is encrypted locally and restored through a scoped in-memory handle when needed.
 
 The Compose file binds PostgreSQL to `127.0.0.1` only. Change the example database password before using this beyond a single trusted development machine, and URL-encode special characters when copying it into `RESUME_AGENT_DATABASE_URL`.
 
@@ -299,7 +305,7 @@ git diff --cached --check
 git diff --cached
 ```
 
-Never commit a real resume, API key, GitHub token, browser profile, cookie, database, or generated artifact.
+Never commit a real resume, API key, Gitee token, browser profile, cookie, database, or generated artifact.
 
 ## Tests
 
@@ -330,9 +336,9 @@ Install Microsoft Word or LibreOffice and restart the backend. Markdown and DOCX
 </details>
 
 <details>
-<summary>GitHub template download times out</summary>
+<summary>Gitee template listing or download times out</summary>
 
-Check DNS, firewall, system proxy, `github.com`, and `raw.githubusercontent.com`. A temporary GitHub token can reduce rate limits but is not persisted. The built-in Chinese template remains available.
+Check DNS, firewall, system proxy, and `gitee.com`. Re-save and test the Gitee token under **Additional configuration**. The built-in Chinese template remains available if the fixed remote directory cannot be reached.
 </details>
 
 ## Repository Layout
@@ -340,7 +346,7 @@ Check DNS, firewall, system proxy, `github.com`, and `raw.githubusercontent.com`
 ```text
 app/
   core/       schemas, persistence, model gateway, encrypted secret store
-  mcp/        FastMCP BOSS and GitHub servers, Edge adapter, MCP client
+  mcp/        FastMCP BOSS and Gitee servers, Edge adapter, MCP client
   services/   parsing, matching, generation, workflow, templates, export
   ui/         Streamlit application and clipboard components
 alembic/      PostgreSQL migrations

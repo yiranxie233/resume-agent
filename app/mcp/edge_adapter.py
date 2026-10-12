@@ -151,6 +151,9 @@ _HR_ACTIVITY_RE = re.compile(
     r"近(?:一)?月活跃|月内活跃|较少活跃)"
 )
 
+_HR_ACTIVITY_PENDING = "活跃时间待解析"
+_HR_ACTIVITY_NOT_SHOWN = "未显示活跃状态"
+
 
 def split_recruiter_card_text(
     hr_name: Any, hr_activity: Any = None
@@ -174,7 +177,7 @@ def split_recruiter_card_text(
             combined,
             flags=re.IGNORECASE,
         ).strip(" |｜·•,，:：")
-    return combined or None, explicit or "活跃时间待解析"
+    return combined or None, explicit or _HR_ACTIVITY_PENDING
 
 
 class EdgeBrowserPort(Protocol):
@@ -1765,36 +1768,65 @@ class PlaywrightEdgeBrowser:
                 self._page.evaluate(
                     r"""
                     () => {
-                      const selectors = [
+                      const explicitSelectors = [
                         'a[ka="header-login"]',
                         'a[href*="/web/user/?ka=header-login"]',
                         'a[href*="/web/user/login"]',
                         'a[href*="/login"]',
                         '.header-login-btn',
                         '.btn-login',
+                        '.login-register',
                         '[data-ka="header-login"]',
                         'header a', 'header button', 'header [role="button"]',
                         '.header a', '.header button', '.header [role="button"]',
                         '[class*="header"] a', '[class*="header"] button',
-                        'nav a', 'nav button'
+                        'nav a', 'nav button',
+                        '.user-nav a', '.user-nav button', '.user-nav [role="button"]',
+                        '[class*="user-nav"] a', '[class*="user-nav"] button',
+                        '[class*="nav-user"] a', '[class*="nav-user"] button',
+                        '[class*="login"]', '[class*="register"]'
                       ];
-                      const nodes = new Set(selectors.flatMap((selector) =>
+                      const explicitNodes = new Set(explicitSelectors.flatMap((selector) =>
                         Array.from(document.querySelectorAll(selector))
                       ));
+                      // BOSS currently places 登录/注册 in a normal div-based
+                      // user toolbar on some builds, rather than a semantic
+                      // <header>/<nav>. Inspect clickable controls globally,
+                      // but accept plain labels only in the visible top-right
+                      // band so job copy containing “登录” cannot cause logout.
+                      const nodes = new Set([
+                        ...explicitNodes,
+                        ...document.querySelectorAll([
+                          'a', 'button', '[role="button"]',
+                          '[class*="user-nav"] span', '[class*="nav-user"] span'
+                        ].join(','))
+                      ]);
                       const exactLoginLabels = new Set([
-                        '登录/注册', '登录／注册', '登录|注册', '登录', '注册'
+                        '登录/注册', '登录／注册', '登录|注册', '登录注册', '登录', '注册'
                       ]);
                       return Array.from(nodes).some((node) => {
                         const style = window.getComputedStyle(node);
                         const rect = node.getBoundingClientRect();
-                        const visible = style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+                        const visible = style.display !== 'none' &&
+                          style.visibility !== 'hidden' &&
+                          Number(style.opacity || '1') > 0 &&
+                          rect.width > 0 && rect.height > 0;
                         if (!visible) return false;
-                        const label = (node.textContent || '').replace(/\s+/g, '').trim();
+                        const label = String(
+                          node.innerText || node.textContent ||
+                          node.getAttribute?.('aria-label') ||
+                          node.getAttribute?.('title') || ''
+                        ).replace(/\s+/g, '').trim();
                         const href = String(node.getAttribute?.('href') || '');
                         const marker = String(node.getAttribute?.('ka') || node.getAttribute?.('data-ka') || '');
-                        return exactLoginLabels.has(label) ||
-                          /(?:^|[-_])header-login(?:$|[-_])/.test(marker) ||
-                          /\/web\/user\/(?:login)?(?:\?|$)|\/login(?:\?|$)/.test(href);
+                        const markerLogin = /(?:^|[-_])(?:header-)?login(?:$|[-_])/.test(marker);
+                        const hrefLogin = /\/web\/user\/(?:login)?(?:\?|$)|\/login(?:\?|$)/.test(href);
+                        if (markerLogin || hrefLogin) return true;
+                        const topBand = rect.bottom >= 0 &&
+                          rect.top <= Math.max(160, window.innerHeight * 0.22);
+                        const rightBand = rect.right >= window.innerWidth * 0.55;
+                        return exactLoginLabels.has(label) &&
+                          (explicitNodes.has(node) || (topBand && rightBand));
                       });
                     }
                     """
@@ -1952,9 +1984,11 @@ class PlaywrightEdgeBrowser:
 
         Each card is selected in place, but its pair is accepted only when the
         rendered detail can be tied to the target URL or to both the target
-        title and company. Name and activity must then come from the same
-        recruiter subtree. A stale asynchronous pane therefore cannot mix one
-        job's HR with another job's activity.
+        title and company. The recruiter name and optional activity are then
+        read from one recruiter subtree. A recruiter card without activity is
+        a valid state (long-inactive recruiters may have no status), while a
+        stale asynchronous pane can never mix one job's HR with another job's
+        activity.
         """
 
         self._ensure_started()
@@ -2033,17 +2067,26 @@ class PlaywrightEdgeBrowser:
                 if (honorific) return honorific[1];
                 return null;
               }};
+              const visible = (node) => {{
+                if (!node) return false;
+                const rect = node.getBoundingClientRect();
+                const style = getComputedStyle(node);
+                return rect.width > 0 && rect.height > 0 &&
+                  style.display !== 'none' && style.visibility !== 'hidden';
+              }};
+              const compactText = (node) => String(
+                node?.innerText || node?.textContent || ''
+              ).replace(/\s+/g, ' ').trim();
+              let stableKey = '';
+              let stableCount = 0;
+              let stableBlankRecruiter = null;
               const deadline = Date.now() + 2200;
               while (Date.now() < deadline) {{
                 const roots = Array.from(document.querySelectorAll(
                   '.job-detail-container, .job-detail-box, .job-detail-wrap, '
                   + '.job-detail-content, .job-detail, [class*="job-detail"]'
-                )).filter((node) => {{
-                  const rect = node.getBoundingClientRect();
-                  const style = getComputedStyle(node);
-                  return rect.width > 0 && rect.height > 0 && style.display !== 'none' &&
-                    style.visibility !== 'hidden';
-                }});
+                )).filter(visible);
+                let observedRecruiter = null;
                 for (const root of roots) {{
                   const heading = root.querySelector(
                     '.job-name, .name h1, .job-banner .name, h1, h2'
@@ -2063,61 +2106,96 @@ class PlaywrightEdgeBrowser:
                     (company && (company.includes(expectedCompany) || expectedCompany.includes(company))) ||
                     rootText.includes(expectedCompany)
                   );
-                  const selectedCard = card.matches(
-                    '.active, .selected, [aria-selected="true"], [class*="selected"]'
-                  ) || Boolean(card.querySelector(
-                    '.active, .selected, [aria-selected="true"], [class*="selected"]'
-                  ));
                   // Title alone is not unique enough (many cards share it).
-                  // URL is strongest; otherwise require title plus the
-                  // expected company, or the exact selected card after its
-                  // right-hand heading has switched.
-                  if (!correctLink && !(correctTitle && (correctCompany || selectedCard))) continue;
+                  // URL is strongest; otherwise both title and company must
+                  // match. Merely marking the left card as selected happens
+                  // before the asynchronous detail pane switches and is not
+                  // sufficient evidence that the pane is current.
+                  if (!correctLink && !(correctTitle && correctCompany)) continue;
 
                   const explicitRecruiterRoots = Array.from(root.querySelectorAll([
-                    '.job-boss-info', '.boss-info', '.job-detail-boss',
+                    '.job-boss-info', '.job-detail-boss',
                     '.boss-info-box', '.boss-card', '.recruiter-card',
                     '[class*="job-boss"]', '[class*="boss-info"]',
                     '[class*="recruiter"]'
-                  ].join(','))).filter((node) => !node.closest(
-                    '.job-list-container, .rec-job-list, .job-list-box'
-                  ));
+                  ].join(','))).filter((node) =>
+                    visible(node) && !node.closest(
+                      '.job-list-container, .rec-job-list, .job-list-box'
+                    )
+                  );
                   // DOM class names have changed across BOSS releases.  A
                   // semantic fallback finds the smallest visible subtree that
-                  // contains both a recruiter honorific and an activity label.
+                  // looks like the fixed recruiter card. Activity is optional:
+                  // BOSS leaves the status blank for some long-inactive HRs.
                   const semanticRecruiterRoots = Array.from(root.querySelectorAll('div, section, li'))
                     .filter((node) => {{
                       if (node.closest('.job-list-container, .rec-job-list, .job-list-box')) return false;
-                      const rect = node.getBoundingClientRect();
-                      const style = getComputedStyle(node);
-                      if (rect.width <= 0 || rect.height <= 0 || style.display === 'none' || style.visibility === 'hidden') return false;
-                      const value = String(node.innerText || node.textContent || '')
-                        .replace(/\s+/g, ' ').trim();
+                      if (!visible(node)) return false;
+                      const value = compactText(node);
+                      const className = String(node.className || '');
+                      const recruiterShape = /(boss|recruiter)/i.test(className) ||
+                        Boolean(node.querySelector('img')) ||
+                        /与BOSS沟通|立即沟通/.test(value);
                       return value.length <= 240 &&
                         /[\u4e00-\u9fffA-Za-z·]{{1,20}}(?:先生|女士)/.test(value) &&
-                        Boolean(activityFrom(value));
+                        recruiterShape;
                     }})
                     .sort((left, right) =>
-                      String(left.innerText || left.textContent || '').length -
-                      String(right.innerText || right.textContent || '').length
+                      compactText(left).length - compactText(right).length
                     );
                   const recruiterRoots = [...new Set([
                     ...explicitRecruiterRoots,
                     ...semanticRecruiterRoots
-                  ])];
+                  ])].sort((left, right) =>
+                    compactText(left).length - compactText(right).length
+                  );
                   for (const recruiterRoot of recruiterRoots) {{
                     const hrName = recruiterNameFrom(recruiterRoot);
                     const activity = activityFrom(
                       recruiterRoot.innerText || recruiterRoot.textContent || ''
                     );
-                    // Atomic pair only: partial data can never overwrite the
-                    // corresponding values taken from the search card.
-                    if (activity && hrName) {{
-                      return {{hr_name: hrName, hr_activity: activity}};
+                    if (hrName) {{
+                      observedRecruiter = {{
+                        hr_name: hrName,
+                        hr_activity: activity,
+                        recruiter_found: true
+                      }};
+                      break;
                     }}
                   }}
+                  if (observedRecruiter) break;
+                }}
+                if (observedRecruiter) {{
+                  const key = `${{observedRecruiter.hr_name}}\u0000${{observedRecruiter.hr_activity || ''}}`;
+                  if (key === stableKey) stableCount += 1;
+                  else {{
+                    stableKey = key;
+                    stableCount = 1;
+                  }}
+                  // Require the same DOM result in consecutive polls. This
+                  // avoids accepting a half-updated recruiter card.
+                  if (stableCount >= 2 && observedRecruiter.hr_activity) {{
+                    return observedRecruiter;
+                  }}
+                  if (stableCount >= 2 && !observedRecruiter.hr_activity) {{
+                    stableBlankRecruiter = observedRecruiter;
+                  }}
+                }} else {{
+                  stableKey = '';
+                  stableCount = 0;
+                  stableBlankRecruiter = null;
                 }}
                 await new Promise((resolve) => setTimeout(resolve, 120));
+              }}
+              // Wait through the complete polling window before accepting an
+              // empty status, because the activity badge may load after the
+              // recruiter name. A confirmed recruiter card with no badge is
+              // different from a card that could not be parsed.
+              if (stableBlankRecruiter) {{
+                return {{
+                  ...stableBlankRecruiter,
+                  hr_activity: '未显示活跃状态'
+                }};
               }}
               return null;
             }}
@@ -2127,7 +2205,7 @@ class PlaywrightEdgeBrowser:
                 if isinstance(recruiter, dict):
                     hr_name = str(recruiter.get("hr_name") or "").strip()
                     activity = str(recruiter.get("hr_activity") or "").strip()
-                    if hr_name and activity:
+                    if recruiter.get("recruiter_found") and hr_name and activity:
                         item["hr_name"] = hr_name
                         item["hr_activity"] = activity
             except Exception:
@@ -2308,38 +2386,86 @@ class PlaywrightEdgeBrowser:
             }
             return null;
           };
-          const activity = () => {
-            const selectors = [
-              '.boss-active-time', '.job-boss-info .boss-active-time',
-              '.job-boss-info .boss-status', '.boss-info-attr .boss-status',
-              '.job-boss-info', '.boss-info', '.job-detail-boss',
-              '.info-publis', '.job-publish', '.boss-info-attr',
-              '[class*="active-time"]', '[class*="boss-status"]',
-              '[class*="boss-online"]', '[class*="recruiter"]'
-            ];
-            const pattern = /(刚刚活跃|当前在线|在线|今日活跃|今天活跃|昨日活跃|昨天活跃|[一二两三四五六七八九十\d]+\s*(?:分钟|小时|天|日|周|个月|月)(?:内|前)?活跃|本周活跃|本月活跃|近(?:一|两|二)?周活跃|近(?:一)?月活跃|月内活跃|半年内活跃|较少活跃)/;
-            for (const selector of selectors) {
-              for (const node of document.querySelectorAll(selector)) {
-                const value = (node.textContent || '').trim();
-                const match = value.match(pattern);
-                if (match) return match[1];
-              }
-            }
-            for (const selector of ['.job-boss-info', '.boss-info', '.job-detail-boss', '.job-detail-container']) {
-              const value = document.querySelector(selector)?.innerText || '';
-              const match = value.match(pattern);
-              if (match) return match[1];
-            }
-            return null;
+          const visible = (node) => {
+            if (!node) return false;
+            const rect = node.getBoundingClientRect();
+            const style = getComputedStyle(node);
+            return rect.width > 0 && rect.height > 0 &&
+              style.display !== 'none' && style.visibility !== 'hidden';
           };
+          const compactText = (node) => String(
+            node?.innerText || node?.textContent || ''
+          ).replace(/\s+/g, ' ').trim();
+          const activityPattern = /(刚刚活跃|当前在线|在线|今日活跃|今天活跃|昨日活跃|昨天活跃|[一二两三四五六七八九十\d]+\s*(?:分钟|小时|天|日|周|个月|月)(?:内|前)?活跃|半年(?:内|前)?活跃|本周活跃|本月活跃|近(?:一|两|二)?周活跃|近(?:一)?月活跃|月内活跃|较少活跃)/;
+          const recruiterNameFrom = (root) => {
+            for (const selector of [
+              '.boss-name', '.name', '.recruiter-name',
+              '[class*="boss-name"]', '[class*="recruiter-name"]'
+            ]) {
+              const source = root.querySelector(selector);
+              if (!source) continue;
+              const copy = source.cloneNode(true);
+              copy.querySelectorAll(
+                '.boss-active-time, .boss-status, [class*="active-time"], '
+                + '[class*="boss-status"], [class*="online"], i, svg'
+              ).forEach((node) => node.remove());
+              const value = String(copy.textContent || '')
+                .replace(activityPattern, ' ').replace(/\s+/g, ' ').trim();
+              const honorific = value.match(/([\u4e00-\u9fffA-Za-z·]{1,20}(?:先生|女士))/);
+              if (honorific) return honorific[1];
+              if (value && value.length <= 40) return value;
+            }
+            const rootText = compactText(root);
+            const honorific = rootText.match(/([\u4e00-\u9fffA-Za-z·]{1,20}(?:先生|女士))/);
+            return honorific ? honorific[1] : null;
+          };
+          const recruiter = () => {
+            const explicitRoots = Array.from(document.querySelectorAll([
+              '.job-boss-info', '.job-detail-boss', '.boss-info-box',
+              '.boss-card', '.recruiter-card', '[class*="job-boss"]',
+              '[class*="boss-info"]', '[class*="recruiter"]'
+            ].join(','))).filter((node) =>
+              visible(node) && !node.closest(
+                '.job-list-container, .rec-job-list, .job-list-box'
+              )
+            );
+            const semanticRoots = Array.from(document.querySelectorAll('div, section, li'))
+              .filter((node) => {
+                if (!visible(node) || node.closest(
+                  '.job-list-container, .rec-job-list, .job-list-box'
+                )) return false;
+                const value = compactText(node);
+                const className = String(node.className || '');
+                const recruiterShape = /(boss|recruiter)/i.test(className) ||
+                  Boolean(node.querySelector('img')) ||
+                  /与BOSS沟通|立即沟通/.test(value);
+                return value.length <= 240 && recruiterShape &&
+                  /[\u4e00-\u9fffA-Za-z·]{1,20}(?:先生|女士)/.test(value);
+              });
+            const candidates = [...new Set([...explicitRoots, ...semanticRoots])]
+              .sort((left, right) => compactText(left).length - compactText(right).length);
+            for (const root of candidates) {
+              const hrName = recruiterNameFrom(root);
+              if (!hrName) continue;
+              const activity = compactText(root).match(activityPattern)?.[1] || null;
+              return {
+                hr_name: hrName,
+                hr_activity: activity,
+                hr_recruiter_found: true
+              };
+            }
+            return {hr_name: null, hr_activity: null, hr_recruiter_found: false};
+          };
+          const recruiterInfo = recruiter();
           return {
             title: text(['.name h1', '.job-banner .name', 'h1']),
             company: text(['.company-info .name', '.company-name']),
             city: text(['.job-address .location-address', '.job-banner .text-desc']),
             salary: text(['.salary']),
             description: description(),
-            hr_name: text(['.boss-name', '.job-boss-info .name', '.boss-info .name', '.job-detail-boss .name', '[class*="boss-name"]']),
-            hr_activity: activity(),
+            hr_name: recruiterInfo.hr_name,
+            hr_activity: recruiterInfo.hr_activity,
+            hr_recruiter_found: recruiterInfo.hr_recruiter_found,
             posted_label: text(['.job-time', '.job-publish-time', '.publish-time', 'time[datetime]']) ||
               document.querySelector('meta[property="article:published_time"]')?.content || null,
             body_text: document.body?.innerText || ''
@@ -2837,6 +2963,12 @@ class EdgeBossAdapter:
                     time.sleep(0.2)
                     latest = self.browser.detail_fields()
                     fields.update({key: value for key, value in latest.items() if value})
+                if (
+                    fields.get("hr_recruiter_found")
+                    and str(fields.get("hr_name") or "").strip()
+                    and not str(fields.get("hr_activity") or "").strip()
+                ):
+                    fields["hr_activity"] = _HR_ACTIVITY_NOT_SHOWN
             except Exception as exc:
                 keep_manual_tab = (
                     isinstance(exc, EdgeActionRequired)

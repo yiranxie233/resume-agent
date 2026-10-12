@@ -48,6 +48,8 @@ weights/
 
 # User documents, screenshots and generated artifacts
 简历*.md
+笔记*.md
+后续*.md
 resume.local.md
 photos/
 output/

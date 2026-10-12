@@ -10,7 +10,7 @@ from app.main import _attach_template_visual_preview, download_template, search_
 from app.services.export_service import PreviewResult
 
 
-class _GitHubManager:
+class _GiteeManager:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, dict]] = []
 
@@ -18,23 +18,25 @@ class _GitHubManager:
         return None
 
     async def health(self, *, probe: bool = False) -> dict:
-        return {"github": {"name": "github", "status": "ready"}}
+        return {"gitee": {"name": "gitee", "status": "ready"}}
 
     async def call_tool(self, server: str, tool: str, arguments: dict) -> dict:
         self.calls.append((server, tool, dict(arguments)))
-        if tool == "github_search_resume_templates":
+        if tool == "gitee_list_resume_templates":
             return {
                 "ok": True,
                 "data": {
                     "items": [
                         {
-                            "template_id": "github-0123456789abcdef01234567",
+                            "template_id": "gitee-0123456789abcdef01234567",
                             "name": "中文技术简历",
-                            "file_type": "markdown",
+                            "file_type": "docx",
                             "language": "zh",
-                            "license": "MIT",
+                            "license": "upstream-repository",
                             "license_allowed": True,
-                            "source_url": "https://raw.githubusercontent.com/example/resume/main/resume.md",
+                            "repository": "hicv-cn/hicv-word-resume-templates-jianyue-single",
+                            "file_path": "templates/02_简约简历/单页/中文技术简历.docx",
+                            "source_url": "https://gitee.com/hicv-cn/hicv-word-resume-templates-jianyue-single/blob/main/templates/02_%E7%AE%80%E7%BA%A6%E7%AE%80%E5%8E%86/%E5%8D%95%E9%A1%B5/%E4%B8%AD%E6%96%87%E6%8A%80%E6%9C%AF%E7%AE%80%E5%8E%86.docx",
                         }
                     ]
                 },
@@ -43,15 +45,15 @@ class _GitHubManager:
             "ok": True,
             "data": {
                 "status": "cached",
-                "template_id": "github-0123456789abcdef01234567",
-                "path": "data/templates/cache/template/resume.md",
+                "template_id": "gitee-0123456789abcdef01234567",
+                "path": "data/templates/cache/template/resume.docx",
                 "metadata": {
-                    "template_id": "github-0123456789abcdef01234567",
-                    "repository": "example/resume",
-                    "source_url": "https://raw.githubusercontent.com/example/resume/main/resume.md",
-                    "file_type": "markdown",
+                    "template_id": "gitee-0123456789abcdef01234567",
+                    "repository": "hicv-cn/hicv-word-resume-templates-jianyue-single",
+                    "source_url": "https://gitee.com/hicv-cn/hicv-word-resume-templates-jianyue-single",
+                    "file_type": "docx",
                     "language": "zh",
-                    "license": "MIT",
+                    "license": "upstream-repository",
                     "license_allowed": True,
                 },
             },
@@ -120,29 +122,32 @@ class TemplateMcpApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(visual["approximate_layout"])
         self.assertIn("docx-page", visual["content"])
 
-    async def test_search_and_download_use_github_mcp(self) -> None:
-        manager = _GitHubManager()
+    async def test_search_and_download_use_gitee_mcp(self) -> None:
+        manager = _GiteeManager()
         mirror = _TemplateMirror()
         app_state = SimpleNamespace(
             mcp_manager=manager,
             mcp_startup_errors={},
             db_mirror=mirror,
         )
-        with patch("app.main.state", return_value=app_state):
-            searched = await search_templates({"query": "中文技术简历"}, None)
-            self.assertEqual(searched["source"], "github_mcp")
+        with (
+            patch("app.main.state", return_value=app_state),
+            patch("app.main._gitee_token", return_value="test-token"),
+        ):
+            searched = await search_templates({"source": "gitee"}, None)
+            self.assertEqual(searched["source"], "gitee_mcp")
             item = searched["items"][0]
             downloaded = await download_template(
                 item["template_id"],
-                {"source_url": item["source_url"], "repository": "example/resume"},
+                {"file_path": item["file_path"]},
                 None,
             )
 
-        self.assertEqual(downloaded["source"], "github_mcp")
-        self.assertEqual(mirror.metadata[0]["license"], "MIT")
+        self.assertEqual(downloaded["source"], "gitee_mcp")
+        self.assertEqual(mirror.metadata[0]["license"], "upstream-repository")
         self.assertEqual(
             [tool for _, tool, _ in manager.calls],
-            ["github_search_resume_templates", "github_download_template"],
+            ["gitee_list_resume_templates", "gitee_download_template"],
         )
 
 

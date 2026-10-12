@@ -34,7 +34,7 @@ dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.6"]
 resume-agent-api = "app.main:run"
 resume-agent-ui = "app.ui.streamlit_app:main"
 resume-agent-boss-mcp = "app.mcp.boss_server:main"
-resume-agent-github-mcp = "app.mcp.github_server:main"
+resume-agent-gitee-mcp = "app.mcp.gitee_server:main"
 
 [tool.setuptools.packages.find]
 include = ["app*"]

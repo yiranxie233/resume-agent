@@ -285,13 +285,13 @@ class OfficialTransportBoundaryTests(unittest.IsolatedAsyncioTestCase):
     async def test_real_official_stdio_initialize_list_call_and_close(self) -> None:
         manager = MCPClientManager(default_server_specs())
         try:
-            await manager.start(["github"])
-            names = [item["name"] for item in await manager.list_tools("github")]
-            self.assertIn("github_preview_template", names)
-            result = await manager.call_tool("github", "github_preview_template", {})
+            await manager.start(["gitee"])
+            names = [item["name"] for item in await manager.list_tools("gitee")]
+            self.assertIn("gitee_preview_template", names)
+            result = await manager.call_tool("gitee", "gitee_preview_template", {})
             self.assertFalse(result["ok"])
             self.assertEqual(result["error_code"], "missing_template_reference")
-            self.assertEqual((await manager.health(probe=True))["github"]["status"], "ready")
+            self.assertEqual((await manager.health(probe=True))["gitee"]["status"], "ready")
         finally:
             await manager.close()
 

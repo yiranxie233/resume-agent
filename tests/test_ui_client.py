@@ -257,12 +257,12 @@ class StreamlitApiClientTests(unittest.TestCase):
 
     def test_template_errors_distinguish_configuration_rate_limit_and_network(self) -> None:
         auth = _template_error_detail(
-            ApiRequestError(401, "github_auth_failed", "bad token"),
-            stage="在 GitHub 查找",
+            ApiRequestError(401, "gitee_auth_failed", "bad token"),
+            stage="读取 Gitee 固定模板目录",
         )
         limited = _template_error_detail(
-            "github_rate_limited",
-            stage="在 GitHub 查找",
+            "gitee_rate_limited",
+            stage="读取 Gitee 固定模板目录",
         )
         network = _template_error_detail(
             "ConnectError: getaddrinfo failed",
@@ -270,7 +270,7 @@ class StreamlitApiClientTests(unittest.TestCase):
         )
 
         self.assertEqual(auth["category"], "配置问题")
-        self.assertEqual(limited["category"], "GitHub 限流")
+        self.assertEqual(limited["category"], "Gitee 限流")
         self.assertEqual(network["category"], "网络问题")
 
     def test_live_ollama_models_are_listed_and_filtered_by_capability(self) -> None:

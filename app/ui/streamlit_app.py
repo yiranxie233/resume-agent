@@ -83,7 +83,7 @@ def _request(method: str, path: str, **kwargs: Any) -> Any:
         try:
             # FastAPI is a loopback service.  A VPN may install HTTP(S)_PROXY
             # without a matching NO_PROXY entry; never send this private local
-            # API traffic through that proxy.  The backend's outbound GitHub
+            # API traffic through that proxy. The backend's outbound template
             # and model calls still honour the user's system/VPN settings.
             response = httpx.request(
                 method,
@@ -510,7 +510,7 @@ def _set_all_candidate_confirmations(
 def _template_download_payload(item: dict[str, Any]) -> dict[str, Any]:
     return {
         key: item.get(key)
-        for key in ("source_url", "repository", "file_path", "remote_version", "filename")
+        for key in ("file_path", "remote_version")
         if item.get(key)
     }
 
@@ -528,17 +528,17 @@ def _template_error_detail(
         code = error
     raw = error.message if isinstance(error, ApiRequestError) else str(error)
     lowered = f"{code} {raw}".casefold()
-    if code in {"github_auth_failed", "credential_missing"} or "401" in lowered:
+    if code in {"gitee_auth_failed", "credential_missing"} or "401" in lowered:
         category = "配置问题"
-        message = "GitHub Token 无效、已过期或未提供"
-        suggestion = "返回环境设置重新填写本次会话的 GitHub Token；公开仓库也可稍后匿名重试。"
-    elif code in {"github_rate_limited"} or "rate limit" in lowered or "429" in lowered:
-        category = "GitHub 限流"
-        message = "GitHub API 请求次数已受限"
-        suggestion = "稍后重试，或在设置中临时填写 GitHub Token 后再试。"
+        message = "Gitee 授权码无效、已过期或尚未保存"
+        suggestion = "返回环境设置的“其他配置”，重新填写并检测 Gitee 授权码。"
+    elif code in {"gitee_rate_limited"} or "rate limit" in lowered or "429" in lowered:
+        category = "Gitee 限流"
+        message = "Gitee API 请求次数已受限"
+        suggestion = "稍后重试，或检查已保存的 Gitee 授权码权限。"
     elif code in {"mcp_unavailable", "mcp_process_exited", "mcp_startup_failed"}:
         category = "MCP 服务问题"
-        message = "GitHub 模板 MCP 没有正常启动或已退出"
+        message = "Gitee 模板 MCP 没有正常启动或已退出"
         suggestion = "确认项目 MCP 依赖已安装，并点击重新尝试；系统会保留内置模板。"
     elif code in {"template_license_unknown", "template_license_not_allowed"}:
         category = "许可证问题"
@@ -558,12 +558,12 @@ def _template_error_detail(
             "connection",
             "timed out",
             "timeout",
-            "github_unavailable",
+            "gitee_unavailable",
         )
     ):
         category = "网络问题"
-        message = "无法连接 GitHub 或请求超时"
-        suggestion = "检查网络、DNS、系统代理和防火墙是否允许访问 github.com 与 raw.githubusercontent.com。"
+        message = "无法连接 Gitee 或请求超时"
+        suggestion = "检查网络、DNS、系统代理和防火墙是否允许访问 gitee.com。"
     else:
         category = "未知问题"
         message = raw.splitlines()[0][:240] if raw else "模板处理失败"
@@ -579,70 +579,55 @@ def _template_error_detail(
 
 
 def _render_wizard_template_picker(st: Any) -> str | None:
-    """Fetch, cache, preview and select a verified Chinese GitHub template."""
+    """Fetch, cache, preview and select a DOCX template from fixed Gitee source."""
 
     if "wizard_template_catalog" not in st.session_state:
-        catalog: dict[str, Any] = {"items": [], "errors": [], "stage": "github_search"}
-        progress = st.progress(0, text="正在 GitHub 查找中文简历模板…")
+        catalog: dict[str, Any] = {"items": [], "errors": [], "stage": "gitee_list"}
+        progress = st.progress(0, text="正在连接 Gitee…")
         stage_text = st.empty()
         try:
-            candidates_by_id: dict[str, dict[str, Any]] = {}
-            searched: dict[str, Any] = {}
-            # One GitHub result page may contain fewer than five licensed,
-            # content-verified files. Continue to the next repository page
-            # before falling back, so the picker normally offers five real
-            # high-star/high-relevance templates rather than one text snippet.
-            for search_page in (1, 2, 3):
-                searched = _request(
-                    "POST",
-                    "/api/templates/search",
-                    timeout=240,
-                    json={
-                        "query": "中文 简历 模板",
-                        "source": "github",
-                        "page": search_page,
-                        "per_page": 5,
-                        "credential_handle_id": st.session_state.get(
-                            "github_credential_handle"
-                        ),
-                    },
-                )
-                catalog["source"] = searched.get("source")
-                if searched.get("error_code"):
-                    catalog["errors"].append(
-                        _template_error_detail(
-                            str(searched.get("error_code")),
-                            stage="在 GitHub 查找",
-                        )
+            stage_text.info("正在读取固定模板目录 templates/02_简约简历/单页…")
+            searched = _request(
+                "POST",
+                "/api/templates/search",
+                timeout=240,
+                json={
+                    "source": "gitee",
+                    "page": 1,
+                    "per_page": 5,
+                    "credential_handle_id": st.session_state.get(
+                        "gitee_credential_handle"
+                    ),
+                },
+            )
+            catalog["source"] = searched.get("source")
+            if searched.get("error_code"):
+                catalog["errors"].append(
+                    _template_error_detail(
+                        str(searched.get("error_code")),
+                        stage="读取 Gitee 固定模板目录",
                     )
-                for item in searched.get("items") or []:
-                    if not isinstance(item, dict):
-                        continue
-                    template_id = str(item.get("template_id") or "")
-                    if template_id.startswith("github-"):
-                        candidates_by_id.setdefault(template_id, item)
-                if len(candidates_by_id) >= 5 or searched.get("source") == "builtin_fallback":
-                    break
-                stage_text.info(
-                    f"当前找到 {len(candidates_by_id)}/5 个合格模板，继续查找下一批仓库…"
                 )
-            candidates = sorted(
-                candidates_by_id.values(),
-                key=lambda item: (-int(item.get("stars") or 0), str(item.get("repository") or "")),
-            )[:5]
+            candidates = [
+                item
+                for item in (searched.get("items") or [])
+                if isinstance(item, dict)
+                and str(item.get("template_id") or "").startswith("gitee-")
+                and item.get("file_type") == "docx"
+            ][:5]
             if 0 < len(candidates) < 5:
                 catalog["errors"].append(
                     {
-                        "stage": "在 GitHub 查找",
+                        "stage": "读取 Gitee 固定模板目录",
                         "item": None,
                         "code": "template_catalog_incomplete",
                         "category": "模板数量不足",
                         "message": f"仅找到 {len(candidates)} 个通过中文简历结构和许可证校验的模板",
-                        "suggestion": "可暂时从现有模板中选择，或填写 GitHub Token 后重新查找以提高 API 限额。",
+                        "suggestion": "可暂时从现有模板中选择，或检查 Gitee 授权码和固定仓库目录。",
                     }
                 )
             total = len(candidates)
-            progress.progress(15, text=f"GitHub 查找完成，准备下载 {total} 个模板")
+            progress.progress(15, text=f"Gitee 目录读取完成，准备下载 {total} 个模板")
             for index, item in enumerate(candidates, 1):
                 template_id = str(item["template_id"])
                 name = str(item.get("name") or template_id)
@@ -659,7 +644,7 @@ def _render_wizard_template_picker(st: Any) -> str | None:
                         json={
                             **_template_download_payload(item),
                             "credential_handle_id": st.session_state.get(
-                                "github_credential_handle"
+                                "gitee_credential_handle"
                             ),
                         },
                     )
@@ -679,11 +664,11 @@ def _render_wizard_template_picker(st: Any) -> str | None:
                     )
             progress.progress(90, text="正在完成模板校验与预览…")
         except Exception as exc:
-            catalog["errors"].append(_template_error_detail(exc, stage="在 GitHub 查找"))
+            catalog["errors"].append(_template_error_detail(exc, stage="读取 Gitee 固定模板目录"))
 
         if not catalog["items"]:
             try:
-                stage_text.info("GitHub 模板暂不可用，正在准备系统内置模板…")
+                stage_text.info("Gitee 模板暂不可用，正在准备系统内置模板…")
                 builtin = {
                     "template_id": "builtin-cn-single-page",
                     "name": "内置中文单页模板",
@@ -1841,33 +1826,44 @@ def _legacy_main() -> None:
 
     with tabs[3]:
         st.subheader("中文简历模板")
-        github_token = st.text_input(
-            "GitHub Token（可选，仅当前进程内存）",
+        try:
+            legacy_gitee_status = _request(
+                "GET", "/api/credentials/stored/gitee-template-access-token"
+            )
+        except Exception:
+            legacy_gitee_status = {}
+        gitee_token = st.text_input(
+            "Gitee 授权码（本机加密保存）",
             type="password",
-            key="github-token",
+            value=_MASKED_API_KEY if legacy_gitee_status.get("usable") else "",
+            key="gitee-token",
         )
-        if st.button("暂存 GitHub Token", key="save-github-token", disabled=not github_token):
+        if st.button("保存 Gitee 授权码", key="save-gitee-token"):
             try:
+                new_secret = _new_api_key(gitee_token)
                 credential = _request(
                     "POST",
                     "/api/credentials/session",
-                    json={"scope": "github", "secret": github_token, "ttl_seconds": 300},
+                    json={
+                        "profile_id": "gitee-template-access-token",
+                        "scope": "gitee",
+                        "gitee_access_token": new_secret,
+                        "persist": bool(new_secret),
+                        "ttl_seconds": 31536000,
+                    },
                 )
-                st.session_state["github_credential_handle"] = credential["credential_handle_id"]
-                st.success("GitHub Token 已暂存在进程内存，5 分钟后失效")
+                st.session_state["gitee_credential_handle"] = credential["credential_handle_id"]
+                st.success("Gitee 授权码已在本机加密保存")
             except Exception as exc:
                 st.error(str(exc))
-        template_query = st.text_input("模板关键词", value="中文 技术 简历 模板", key="template-query")
-        template_type = st.selectbox("模板格式", ["不限", "docx", "markdown"], key="template-type")
-        if st.button("搜索 GitHub 中文模板", key="search-templates"):
+        st.caption("固定读取 templates/02_简约简历/单页，仅显示 DOCX 模板。")
+        if st.button("读取 Gitee 中文模板", key="search-templates"):
             try:
                 template_payload = {
-                    "query": template_query,
+                    "source": "gitee",
                     "per_page": 5,
-                    "credential_handle_id": st.session_state.get("github_credential_handle"),
+                    "credential_handle_id": st.session_state.get("gitee_credential_handle"),
                 }
-                if template_type != "不限":
-                    template_payload["file_type"] = template_type
                 st.session_state["template_search"] = _request(
                     "POST", "/api/templates/search", json=template_payload
                 )
@@ -1905,10 +1901,10 @@ def _legacy_main() -> None:
             if template_cols[0].button("预览模板", key="preview-template"):
                 try:
                     preview_payload = {
-                        "credential_handle_id": st.session_state.get("github_credential_handle")
+                        "credential_handle_id": st.session_state.get("gitee_credential_handle")
                     }
-                    if selected_template.get("source_url"):
-                        preview_payload["source_url"] = selected_template["source_url"]
+                    if selected_template.get("file_path"):
+                        preview_payload["file_path"] = selected_template["file_path"]
                     st.session_state["template_preview"] = _request(
                         "POST",
                         f"/api/templates/{selected_template_id}/preview",
@@ -1920,10 +1916,10 @@ def _legacy_main() -> None:
                 try:
                     download_payload = {
                         key: selected_template.get(key)
-                        for key in ("source_url", "repository", "file_path", "remote_version", "filename")
+                        for key in ("file_path", "remote_version")
                         if selected_template.get(key)
                     }
-                    download_payload["credential_handle_id"] = st.session_state.get("github_credential_handle")
+                    download_payload["credential_handle_id"] = st.session_state.get("gitee_credential_handle")
                     cached = _request(
                         "POST",
                         f"/api/templates/{selected_template_id}/download",
@@ -2031,7 +2027,7 @@ def _legacy_main() -> None:
                 ),
                 key=f"flow-template-{job_id}",
             )
-            st.caption("如需选择其他 GitHub 中文模板，可先前往“模板”栏下载，再返回这里选择。")
+            st.caption("如需选择其他 Gitee 中文模板，可先前往“模板”栏下载，再返回这里选择。")
             st.markdown("#### 填写新简历基础信息")
             base_cols = st.columns(2)
             base_facts = {
@@ -2596,7 +2592,7 @@ def _legacy_main() -> None:
 def _render_compact_environment(st: Any) -> None:
     """Render only environment controls needed before entering the wizard."""
 
-    st.subheader("环境与模型")
+    st.subheader("环境与配置")
     if st.button("刷新环境状态", key="wizard-refresh-environment"):
         try:
             st.session_state["environment"] = _request("GET", "/api/environment")
@@ -2612,6 +2608,7 @@ def _render_compact_environment(st: Any) -> None:
         cols[1].metric("数据库", _friendly_status(database_status))
         cols[2].metric("MCP", _friendly_status(mcp_status))
 
+    st.markdown("### 1. 浏览器配置")
     with st.expander("Microsoft Edge", expanded=True):
         try:
             edge_settings = _request("GET", "/api/settings")
@@ -2655,6 +2652,7 @@ def _render_compact_environment(st: Any) -> None:
             if edge_detail:
                 st.caption(edge_detail)
 
+    st.markdown("### 2. 大模型配置")
     try:
         all_profiles = _request("GET", "/api/models")
     except Exception as exc:
@@ -3300,6 +3298,110 @@ def _render_compact_environment(st: Any) -> None:
                     st.rerun()
                 except Exception as exc:
                     st.error(str(exc))
+
+    st.markdown("### 3. 额外其他配置")
+    with st.expander("Gitee 简历模板授权", expanded=True):
+        st.caption(
+            "固定仓库：hicv-cn/hicv-word-resume-templates-jianyue-single ｜ "
+            "固定目录：templates/02_简约简历/单页 ｜ 仅读取 DOCX 文件"
+        )
+        try:
+            gitee_status = _request(
+                "GET", "/api/credentials/stored/gitee-template-access-token"
+            )
+        except Exception:
+            gitee_status = {}
+        gitee_token = st.text_input(
+            "Gitee 授权码（密码输入，本机加密保存）",
+            type="password",
+            value=_MASKED_API_KEY if gitee_status.get("usable") else "",
+            key="wizard-gitee-access-token",
+            placeholder=(
+                "已在本机加密保存，无需重复输入"
+                if gitee_status.get("usable")
+                else "首次使用模板仓库时填写私人令牌"
+            ),
+        )
+        if gitee_status.get("usable"):
+            st.success("Gitee 授权码已在本机加密保存，后续启动可自动使用")
+        elif gitee_status.get("needs_reentry"):
+            st.warning("已保存的 Gitee 授权码无法解密，请重新填写并覆盖保存。")
+
+        def ensure_gitee_credential() -> str:
+            new_secret = _new_api_key(gitee_token)
+            if new_secret:
+                credential = _request(
+                    "POST",
+                    "/api/credentials/session",
+                    json={
+                        "profile_id": "gitee-template-access-token",
+                        "scope": "gitee",
+                        "gitee_access_token": new_secret,
+                        "persist": True,
+                        "ttl_seconds": 31536000,
+                    },
+                )
+            else:
+                stored = _request(
+                    "GET", "/api/credentials/stored/gitee-template-access-token"
+                )
+                if not stored.get("usable"):
+                    raise ValueError("首次使用时必须填写 Gitee 授权码")
+                credential = _request(
+                    "POST",
+                    "/api/credentials/session",
+                    json={
+                        "profile_id": "gitee-template-access-token",
+                        "scope": "gitee",
+                        "persist": False,
+                        "ttl_seconds": 31536000,
+                    },
+                )
+            handle_id = str(credential["credential_handle_id"])
+            st.session_state["gitee_credential_handle"] = handle_id
+            return handle_id
+
+        gitee_actions = st.columns(2)
+        if gitee_actions[0].button(
+            "保存 Gitee 授权码",
+            key="wizard-save-gitee-token",
+            use_container_width=True,
+        ):
+            try:
+                ensure_gitee_credential()
+                st.success("Gitee 授权码已加密保存")
+            except Exception as exc:
+                st.error(str(exc))
+        if gitee_actions[1].button(
+            "保存并检测 Gitee",
+            key="wizard-probe-gitee-token",
+            use_container_width=True,
+        ):
+            try:
+                handle_id = ensure_gitee_credential()
+                st.session_state["gitee_detection"] = _request(
+                    "POST",
+                    "/api/templates/gitee/probe",
+                    timeout=120,
+                    json={"credential_handle_id": handle_id},
+                )
+            except Exception as exc:
+                st.error(str(exc))
+        gitee_detection = st.session_state.get("gitee_detection")
+        if isinstance(gitee_detection, dict):
+            if gitee_detection.get("status") == "ready":
+                st.success(
+                    "Gitee 连接成功，固定目录中检测到 "
+                    f"{gitee_detection.get('template_count', 0)} 个 DOCX 模板"
+                )
+            else:
+                st.error(
+                    str(
+                        gitee_detection.get("message")
+                        or gitee_detection.get("error_code")
+                        or "Gitee 连接检测失败"
+                    )
+                )
 
 
 def _editor_lines(value: str, *, split_commas: bool = False) -> list[str]:
@@ -5107,7 +5209,7 @@ def main() -> None:
     st.set_page_config(page_title="Resume Agent", layout="wide")
     st.title("Resume Agent")
     st.caption("根据岗位 JD 逐步生成项目经历或针对性简历")
-    tabs = st.tabs(["环境与模型", "简历项目向导"])
+    tabs = st.tabs(["环境与配置", "简历项目向导"])
     with tabs[0]:
         _render_compact_environment(st)
     with tabs[1]:
